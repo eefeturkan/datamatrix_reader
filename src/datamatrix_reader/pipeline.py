@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from io import BytesIO
 import math
 from typing import Iterable
@@ -8,7 +9,7 @@ from typing import Iterable
 import cv2
 import numpy as np
 from PIL import Image
-from pylibdmtx.pylibdmtx import decode as dmtx_decode
+from pylibdmtx.pylibdmtx import decode as dmtx_decode, encode as dmtx_encode
 import zxingcpp
 
 
@@ -49,18 +50,93 @@ class _DecodeHit:
     structural_score: float
 
 
+@dataclass(slots=True)
+class _RenderedCandidate:
+    stage_name: str
+    image: np.ndarray
+    bits: np.ndarray
+    score: float
+
+
+@dataclass(slots=True)
+class _DecodedRenderedCandidate:
+    stage_name: str
+    image: np.ndarray
+    bits: np.ndarray
+    score: float
+    decoded_texts: list[str]
+
+
+@dataclass(frozen=True, slots=True)
+class _ReconstructionProfile:
+    response_names: frozenset[str]
+    projection_quantiles: tuple[float, ...]
+    pitch_deltas: tuple[float, ...]
+    shear_values: tuple[float, ...]
+    score_quantiles: tuple[float, ...]
+    decode_limit: int
+    max_decoded: int
+
+
+_FAST_RECONSTRUCTION = _ReconstructionProfile(
+    response_names=frozenset({"mix", "tophat"}),
+    projection_quantiles=(0.65, 0.7),
+    pitch_deltas=(-0.2, 0.0, 0.2),
+    shear_values=(0.0, -0.8, -1.0),
+    score_quantiles=(0.5,),
+    decode_limit=6,
+    max_decoded=12,
+)
+
+_REFINE_RECONSTRUCTION = _ReconstructionProfile(
+    response_names=frozenset({"mix", "tophat"}),
+    projection_quantiles=(0.65, 0.7),
+    pitch_deltas=(-0.4, -0.2, 0.0, 0.2, 0.4),
+    shear_values=(0.0, -0.8, -1.0, -0.6, -1.2),
+    score_quantiles=(0.5, 0.55),
+    decode_limit=18,
+    max_decoded=18,
+)
+
+_FULL_RECONSTRUCTION = _ReconstructionProfile(
+    response_names=frozenset({"mix", "tophat", "blackhat"}),
+    projection_quantiles=(0.65, 0.7, 0.75, 0.8),
+    pitch_deltas=(-0.4, -0.2, 0.0, 0.2, 0.4),
+    shear_values=(-1.4, -1.2, -1.0, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2),
+    score_quantiles=(0.45, 0.5, 0.55, 0.6, 0.65),
+    decode_limit=12,
+    max_decoded=12,
+)
+
+
 def decode_image(image_bytes: bytes) -> DecodeResult:
     bgr = _load_image(image_bytes)
     raw_grayscale = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     grayscale = _normalize_grayscale(bgr)
-    roi_candidates = _generate_roi_candidates(grayscale)
-    raw_roi_candidates = _generate_roi_candidates(raw_grayscale)
+
+    for roi_candidates, fast_only in (
+        (_generate_roi_candidates(raw_grayscale, fast_only=True), True),
+        (_generate_roi_candidates(raw_grayscale, fast_only=False), False),
+    ):
+        reconstructed_candidates, reconstructed_hits = _build_reconstructed_candidates(
+            roi_candidates, fast_only=fast_only
+        )
+        if reconstructed_hits:
+            primary, alternatives = _rank_hits(reconstructed_hits)
+            processed_image = _find_stage_image(reconstructed_candidates, primary.stage_name)
+            return DecodeResult(
+                text=primary.text,
+                engine=primary.engine,
+                stage_name=primary.stage_name,
+                score=primary.score,
+                processed_image=processed_image,
+                alternatives=alternatives,
+            )
+
+    roi_candidates = _generate_roi_candidates(grayscale, fast_only=True)
     image_candidates = _build_image_candidates(roi_candidates)
 
     hits: list[_DecodeHit] = []
-    reconstructed_candidates, reconstructed_hits = _build_reconstructed_candidates(raw_roi_candidates)
-    image_candidates = [*reconstructed_candidates, *image_candidates]
-    hits.extend(reconstructed_hits)
 
     zxing_candidates = image_candidates[:90]
     pylibdmtx_candidates = image_candidates[:36]
@@ -112,12 +188,16 @@ def _normalize_grayscale(image: np.ndarray) -> np.ndarray:
     return cv2.normalize(sharpened, None, 0, 255, cv2.NORM_MINMAX)
 
 
-def _generate_roi_candidates(gray: np.ndarray) -> list[tuple[str, np.ndarray]]:
+def _generate_roi_candidates(gray: np.ndarray, fast_only: bool = False) -> list[tuple[str, np.ndarray]]:
     height, width = gray.shape
     rois: list[tuple[str, np.ndarray]] = [("full", gray)]
     proposed: list[tuple[float, str, np.ndarray]] = []
-    proposed.extend(_generate_inset_rois(gray))
-    proposed.extend(_generate_row_localized_rois(gray))
+    if fast_only:
+        proposed.extend(_generate_inset_rois(gray, fast_only=True))
+        proposed.extend(_generate_row_localized_rois(gray, fast_only=True))
+    else:
+        proposed.extend(_generate_inset_rois(gray, fast_only=False))
+        proposed.extend(_generate_row_localized_rois(gray, fast_only=False))
 
     for invert in (False, True):
         base = 255 - gray if invert else gray
@@ -164,7 +244,7 @@ def _generate_roi_candidates(gray: np.ndarray) -> list[tuple[str, np.ndarray]]:
             continue
         if name.startswith("row20-"):
             rois.append((name, roi))
-            if len(rois) >= 10:
+            if len(rois) >= (6 if fast_only else 10):
                 break
             continue
         shape_key = (roi.shape[0] // 10, roi.shape[1] // 10, int(np.mean(roi)) // 8)
@@ -172,18 +252,19 @@ def _generate_roi_candidates(gray: np.ndarray) -> list[tuple[str, np.ndarray]]:
             continue
         seen_shapes.add(shape_key)
         rois.append((name, roi))
-        if len(rois) >= 7:
+        if len(rois) >= (5 if fast_only else 7):
             break
 
     return rois
 
 
-def _generate_inset_rois(gray: np.ndarray) -> list[tuple[float, str, np.ndarray]]:
+def _generate_inset_rois(gray: np.ndarray, fast_only: bool = False) -> list[tuple[float, str, np.ndarray]]:
     height, width = gray.shape
     proposals: list[tuple[float, str, np.ndarray]] = []
     min_side = min(height, width)
 
-    for inset_ratio in (0.03, 0.05, 0.08, 0.1, 0.12):
+    inset_ratios = (0.08,) if fast_only else (0.03, 0.05, 0.08, 0.1, 0.12)
+    for inset_ratio in inset_ratios:
         inset_x = int(width * inset_ratio)
         inset_y = int(height * inset_ratio)
         x0 = inset_x
@@ -196,14 +277,17 @@ def _generate_inset_rois(gray: np.ndarray) -> list[tuple[float, str, np.ndarray]
         proposals.append((float(crop.shape[0] * crop.shape[1]), f"inset-{inset_ratio:.2f}", crop))
 
     # Square-centered crops work well when the user already supplied a loose crop.
-    for inset_ratio in (0.0, 0.04, 0.08, 0.12):
+    square_insets = (0.08,) if fast_only else (0.0, 0.04, 0.08, 0.12)
+    for inset_ratio in square_insets:
         side = int(min_side * (1.0 - inset_ratio))
         if side < 120:
             continue
         center_x = width / 2
         center_y = height / 2
-        for shift_x_ratio in (-0.06, 0.0, 0.06):
-            for shift_y_ratio in (-0.04, 0.0, 0.04):
+        shift_x_values = (-0.06, 0.0) if fast_only else (-0.06, 0.0, 0.06)
+        shift_y_values = (-0.04, 0.0) if fast_only else (-0.04, 0.0, 0.04)
+        for shift_x_ratio in shift_x_values:
+            for shift_y_ratio in shift_y_values:
                 x0 = int(round(center_x - side / 2 + width * shift_x_ratio))
                 y0 = int(round(center_y - side / 2 + height * shift_y_ratio))
                 x0 = min(max(x0, 0), max(width - side, 0))
@@ -222,13 +306,19 @@ def _generate_inset_rois(gray: np.ndarray) -> list[tuple[float, str, np.ndarray]
     return proposals
 
 
-def _generate_row_localized_rois(gray: np.ndarray) -> list[tuple[float, str, np.ndarray]]:
+def _generate_row_localized_rois(
+    gray: np.ndarray, fast_only: bool = False
+) -> list[tuple[float, str, np.ndarray]]:
     module_count = 20
     points: list[tuple[float, float]] = []
     proposals: list[tuple[float, str, np.ndarray]] = []
-    for variant_name, variant in _iter_row_localization_variants(gray):
-        for response_name, response in _build_reconstruction_responses(variant):
-            for quantile in (0.88, 0.9, 0.92):
+    for variant_name, variant in _iter_row_localization_variants(gray, fast_only=fast_only):
+        responses = _build_reconstruction_responses(variant)
+        if fast_only:
+            responses = [item for item in responses if item[0] in {"mix", "tophat"}]
+        quantiles = (0.9, 0.92) if fast_only else (0.88, 0.9, 0.92)
+        for response_name, response in responses:
+            for quantile in quantiles:
                 threshold_value = np.quantile(response, quantile)
                 binary = (response >= threshold_value).astype(np.uint8)
                 binary = cv2.morphologyEx(
@@ -279,8 +369,12 @@ def _generate_row_localized_rois(gray: np.ndarray) -> list[tuple[float, str, np.
     return proposals[:8]
 
 
-def _iter_row_localization_variants(gray: np.ndarray) -> list[tuple[str, np.ndarray]]:
+def _iter_row_localization_variants(
+    gray: np.ndarray, fast_only: bool = False
+) -> list[tuple[str, np.ndarray]]:
     variants: list[tuple[str, np.ndarray]] = [("base", gray)]
+    if fast_only:
+        return variants
     for angle in (-10.0, -7.0, -4.0, 4.0, 7.0, 10.0):
         variants.append((f"rot{angle:+.0f}", _rotate_image_bound(gray, angle)))
     return variants
@@ -472,53 +566,97 @@ def _build_image_candidates(roi_candidates: Iterable[tuple[str, np.ndarray]]) ->
 
 def _build_reconstructed_candidates(
     roi_candidates: Iterable[tuple[str, np.ndarray]],
+    fast_only: bool = False,
 ) -> tuple[list[_ImageCandidate], list[_DecodeHit]]:
     candidates: list[_ImageCandidate] = []
     hits: list[_DecodeHit] = []
+    decoded_candidates: list[_DecodedRenderedCandidate] = []
 
-    for roi_name, roi in list(roi_candidates)[:8]:
-        reconstructed = _reconstruct_datamatrix_candidates(roi_name, roi)
-        for stage_name, image, decoded_texts in reconstructed:
-            preview_score = _preview_score(image)
-            structural_score = _structural_score(image)
-            candidates.append(
-                _ImageCandidate(
-                    stage_name=stage_name,
-                    image=image,
+    prioritized_rois = sorted(
+        list(roi_candidates),
+        key=lambda item: (
+            0
+            if item[0].startswith("row20-")
+            else 1
+            if item[0].startswith("inset-0.08")
+            else 2
+            if item[0].startswith("square-0.08")
+            else 3,
+            -(item[1].shape[0] * item[1].shape[1]),
+        ),
+    )
+    roi_lookup = {name: roi for name, roi in prioritized_rois}
+    profile = _FAST_RECONSTRUCTION if fast_only else _FULL_RECONSTRUCTION
+
+    for roi_name, roi in prioritized_rois[: (2 if fast_only else 4)]:
+        reconstructed = _reconstruct_datamatrix_candidates(roi_name, roi, profile=profile)
+        decoded_candidates.extend(reconstructed)
+        if decoded_candidates:
+            break
+
+    if fast_only and decoded_candidates:
+        for roi_name in _ambiguous_reconstruction_rois(decoded_candidates):
+            roi = roi_lookup.get(roi_name)
+            if roi is None:
+                continue
+            decoded_candidates.extend(
+                _reconstruct_datamatrix_candidates(
+                    roi_name,
+                    roi,
+                    profile=_REFINE_RECONSTRUCTION,
+                )
+            )
+
+    decoded_candidates = _unique_decoded_rendered_candidates(decoded_candidates)
+    grouped: dict[str, list[_DecodedRenderedCandidate]] = {}
+    for decoded_candidate in decoded_candidates:
+        for text in decoded_candidate.decoded_texts:
+            grouped.setdefault(text, []).append(decoded_candidate)
+
+    for text, group in grouped.items():
+        selected = _select_decoded_group_candidate(group, text)
+        preview_score = selected.score * 10.0
+        structural_score = selected.score * 10.0
+        candidates.append(
+            _ImageCandidate(
+                stage_name=selected.stage_name,
+                image=selected.image,
+                preview_score=preview_score,
+                structural_score=structural_score,
+            )
+        )
+        for _ in group:
+            hits.append(
+                _DecodeHit(
+                    text=text,
+                    engine="zxingcpp-reconstruct",
+                    stage_name=selected.stage_name,
+                    valid=True,
+                    readable_ratio=_readable_ratio(text),
                     preview_score=preview_score,
                     structural_score=structural_score,
                 )
             )
-            for text in decoded_texts:
-                hits.append(
-                    _DecodeHit(
-                        text=text,
-                        engine="zxingcpp-reconstruct",
-                        stage_name=stage_name,
-                        valid=True,
-                        readable_ratio=_readable_ratio(text),
-                        preview_score=preview_score,
-                        structural_score=structural_score,
-                    )
-                )
 
     return candidates, hits
 
 
 def _reconstruct_datamatrix_candidates(
-    roi_name: str, roi: np.ndarray
-) -> list[tuple[str, np.ndarray, list[str]]]:
+    roi_name: str, roi: np.ndarray, profile: _ReconstructionProfile
+) -> list[_DecodedRenderedCandidate]:
     module_count = 20
     if min(roi.shape[:2]) < 180:
         return []
 
-    reconstructed: list[tuple[str, np.ndarray, list[str]]] = []
-    for response_name, response in _build_reconstruction_responses(roi):
+    ranked_candidates: list[_RenderedCandidate] = []
+    responses = _build_reconstruction_responses(roi)
+    responses = [item for item in responses if item[0] in profile.response_names]
+    for response_name, response in responses:
         strip_height = max(16, min(28, roi.shape[0] // 12))
         top_projection = response[:strip_height, :].mean(axis=0)
         min_distance = max(8, roi.shape[1] // 36)
 
-        for projection_quantile in (0.65, 0.7, 0.75, 0.8):
+        for projection_quantile in profile.projection_quantiles:
             threshold = float(np.quantile(top_projection, projection_quantile))
             top_centers = np.array(
                 _find_peaks_1d(top_projection, min_dist=min_distance, threshold=threshold),
@@ -541,39 +679,109 @@ def _reconstruct_datamatrix_candidates(
             top_centers = np.array(fitted_centers, dtype=np.float32)
 
             max_vertical_offset = max(12, int(base_pitch * 2.3))
-            vertical_offsets = range(2, max_vertical_offset + 1, 2)
+            vertical_offsets = _vertical_offsets_for_profile(roi_name, max_vertical_offset, profile)
+            pitch_values = tuple(base_pitch + delta for delta in profile.pitch_deltas)
 
             for vertical_offset in vertical_offsets:
-                for pitch in (
-                    base_pitch - 0.4,
-                    base_pitch - 0.2,
-                    base_pitch,
-                    base_pitch + 0.2,
-                    base_pitch + 0.4,
-                ):
-                    for shear in (-1.4, -1.2, -1.0, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2):
+                for pitch in pitch_values:
+                    for shear in profile.shear_values:
                         scores = np.zeros((module_count, module_count), dtype=np.float32)
                         if not _fill_reconstruction_scores(
                             scores, response, top_centers, vertical_offset, pitch, shear
                         ):
                             continue
 
-                        for quantile in (0.45, 0.5, 0.55, 0.6, 0.65):
+                        for quantile in profile.score_quantiles:
                             threshold_value = float(np.quantile(scores, quantile))
                             bits = (scores >= threshold_value).astype(np.uint8)
                             bits[0, :] = 1
                             bits[:, 0] = 1
-                            _, oriented = _orient_bits(bits)
-                            rendered = _render_bits(oriented)
-                            decoded = _decode_pure_render(rendered)
-                            if decoded:
-                                stage_name = (
-                                    f"{roi_name}:reconstruct:{response_name}:pq{projection_quantile:.2f}:"
-                                    f"y{vertical_offset}:p{pitch:.2f}:s{shear:.2f}:q{quantile:.2f}"
+                            orient_score, oriented = _orient_bits(bits)
+                            occupancy = float(bits.mean())
+                            score = orient_score - abs(occupancy - 0.5) * 1.2
+                            stage_name = (
+                                f"{roi_name}:reconstruct:{response_name}:pq{projection_quantile:.2f}:"
+                                f"y{vertical_offset}:p{pitch:.2f}:s{shear:.2f}:q{quantile:.2f}"
+                            )
+                            ranked_candidates.append(
+                                _RenderedCandidate(
+                                    stage_name=stage_name,
+                                    image=_render_bits(oriented),
+                                    bits=oriented.copy(),
+                                    score=score,
                                 )
-                                reconstructed.append((stage_name, rendered, decoded))
+                            )
 
-    return reconstructed[:12]
+    decoded_candidates: list[_DecodedRenderedCandidate] = []
+    for candidate in _select_top_rendered_candidates(ranked_candidates, limit=profile.decode_limit):
+        decoded = _decode_pure_render(candidate.image)
+        if decoded:
+            decoded_candidates.append(
+                _DecodedRenderedCandidate(
+                    stage_name=candidate.stage_name,
+                    image=candidate.image,
+                    bits=candidate.bits,
+                    score=candidate.score,
+                    decoded_texts=decoded,
+                )
+            )
+            if len(decoded_candidates) >= profile.max_decoded:
+                break
+
+    return decoded_candidates
+
+
+def _vertical_offsets_for_profile(
+    roi_name: str, max_vertical_offset: int, profile: _ReconstructionProfile
+) -> range | tuple[int, ...]:
+    if profile is _FAST_RECONSTRUCTION:
+        if roi_name == "full":
+            return range(2, min(max_vertical_offset, 12) + 1, 2)
+        return (12, 16, 20, 24)
+    if profile is _REFINE_RECONSTRUCTION:
+        if roi_name == "full":
+            return range(2, min(max_vertical_offset, 18) + 1, 2)
+        start = max(8, min(max_vertical_offset, 12))
+        stop = min(max_vertical_offset, 28)
+        return tuple(range(start, stop + 1, 2))
+    return range(2, max_vertical_offset + 1, 2)
+
+
+def _ambiguous_reconstruction_rois(
+    decoded_candidates: Iterable[_DecodedRenderedCandidate],
+) -> list[str]:
+    grouped: dict[str, list[_DecodedRenderedCandidate]] = {}
+    for candidate in decoded_candidates:
+        for text in candidate.decoded_texts:
+            grouped.setdefault(text, []).append(candidate)
+
+    roi_names: list[str] = []
+    seen: set[str] = set()
+    for text, group in grouped.items():
+        unique_bits = {candidate.bits.tobytes() for candidate in group}
+        should_refine = len(unique_bits) > 1
+
+        reference_bits = _reference_bits_for_text(text)
+        if reference_bits is not None:
+            distances = [
+                _bit_distance(candidate.bits, reference_bits)
+                for candidate in group
+                if candidate.bits.shape == reference_bits.shape
+            ]
+            if distances and min(distances) > 0:
+                should_refine = True
+
+        if not should_refine:
+            continue
+
+        for candidate in group:
+            roi_name = candidate.stage_name.split(":reconstruct:", 1)[0]
+            if roi_name in seen:
+                continue
+            seen.add(roi_name)
+            roi_names.append(roi_name)
+
+    return roi_names
 
 
 def _fill_reconstruction_scores(
@@ -628,6 +836,101 @@ def _render_bits(bits: np.ndarray) -> np.ndarray:
     canvas = 255 * (1 - bits.astype(np.uint8))
     image = np.kron(canvas, np.ones((16, 16), dtype=np.uint8))
     return cv2.copyMakeBorder(image, 32, 32, 32, 32, cv2.BORDER_CONSTANT, value=255)
+
+
+def _select_top_rendered_candidates(
+    candidates: Iterable[_RenderedCandidate], limit: int
+) -> list[_RenderedCandidate]:
+    unique: dict[str, _RenderedCandidate] = {}
+    for candidate in sorted(candidates, key=lambda item: item.score, reverse=True):
+        image_key = candidate.image.tobytes()
+        if image_key in unique:
+            continue
+        unique[image_key] = candidate
+        if len(unique) >= limit:
+            break
+    return list(unique.values())
+
+
+def _unique_decoded_rendered_candidates(
+    candidates: Iterable[_DecodedRenderedCandidate],
+) -> list[_DecodedRenderedCandidate]:
+    unique: dict[tuple[str, bytes, tuple[str, ...]], _DecodedRenderedCandidate] = {}
+    for candidate in candidates:
+        key = (candidate.stage_name, candidate.bits.tobytes(), tuple(candidate.decoded_texts))
+        unique[key] = candidate
+    return list(unique.values())
+
+
+def _select_decoded_group_candidate(
+    candidates: list[_DecodedRenderedCandidate], text: str
+) -> _DecodedRenderedCandidate:
+    reference_bits = _reference_bits_for_text(text)
+    if reference_bits is None:
+        return max(candidates, key=lambda item: item.score)
+
+    comparable = [candidate for candidate in candidates if candidate.bits.shape == reference_bits.shape]
+    if not comparable:
+        return max(candidates, key=lambda item: item.score)
+
+    return min(
+        comparable,
+        key=lambda item: (
+            _bit_distance(item.bits, reference_bits),
+            -item.score,
+            item.stage_name,
+        ),
+    )
+
+
+@lru_cache(maxsize=64)
+def _reference_bits_for_text(text: str) -> np.ndarray | None:
+    try:
+        encoded = dmtx_encode(text.encode("utf-8"))
+    except Exception:
+        return None
+
+    width = int(getattr(encoded, "width", 0))
+    height = int(getattr(encoded, "height", 0))
+    pixels = getattr(encoded, "pixels", b"")
+    if width <= 0 or height <= 0 or not pixels:
+        return None
+
+    raster = np.frombuffer(pixels, dtype=np.uint8)
+    channels = max(raster.size // max(width * height, 1), 1)
+    try:
+        raster = raster.reshape(height, width, channels)
+    except ValueError:
+        return None
+
+    gray = raster[:, :, 0]
+    mask = (gray < 128).astype(np.uint8)
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0 or len(ys) == 0:
+        return None
+
+    crop = mask[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
+    module_count = 20
+    if crop.shape[0] % module_count != 0 or crop.shape[1] % module_count != 0:
+        return None
+
+    module_height = crop.shape[0] // module_count
+    module_width = crop.shape[1] // module_count
+    if module_height <= 0 or module_width <= 0:
+        return None
+
+    bits = (
+        crop.reshape(module_count, module_height, module_count, module_width).mean(axis=(1, 3))
+        >= 0.5
+    ).astype(np.uint8)
+    _, oriented = _orient_bits(bits)
+    return oriented
+
+
+def _bit_distance(left: np.ndarray, right: np.ndarray) -> int:
+    if left.shape != right.shape:
+        return max(left.size, right.size)
+    return int(np.count_nonzero(left != right))
 
 
 def _decode_pure_render(rendered: np.ndarray) -> list[str]:
