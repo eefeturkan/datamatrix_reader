@@ -224,51 +224,66 @@ def _generate_inset_rois(gray: np.ndarray) -> list[tuple[float, str, np.ndarray]
 
 def _generate_row_localized_rois(gray: np.ndarray) -> list[tuple[float, str, np.ndarray]]:
     module_count = 20
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(gray)
-    sharpen = cv2.addWeighted(clahe, 1.8, cv2.GaussianBlur(clahe, (0, 0), 1.0), -0.8, 0)
-    tophat = cv2.morphologyEx(
-        sharpen, cv2.MORPH_TOPHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    )
-    threshold_value = np.quantile(tophat, 0.9)
-    binary = (tophat >= threshold_value).astype(np.uint8)
-    binary = cv2.morphologyEx(
-        binary, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-    )
-    component_count, _, stats, centroids = cv2.connectedComponentsWithStats(binary, 8)
-
     points: list[tuple[float, float]] = []
-    for index in range(1, component_count):
-        area = int(stats[index, cv2.CC_STAT_AREA])
-        if 3 <= area <= 120:
-            x, y = centroids[index]
-            points.append((float(x), float(y)))
-
     proposals: list[tuple[float, str, np.ndarray]] = []
-    for row_index, row in enumerate(_cluster_rows(points, tolerance=6.0)):
-        centers_x = _dedupe_x([point[0] for point in row["pts"]])
-        if not (module_count - 1 <= len(centers_x) <= module_count + 2):
-            continue
-        pitch_samples = np.diff(centers_x)
-        pitch_samples = pitch_samples[(pitch_samples > 8.0) & (pitch_samples < 18.0)]
-        if len(pitch_samples) < 6:
-            continue
-        pitch = float(np.median(pitch_samples))
-        if not 10.0 <= pitch <= 16.0:
-            continue
-        fitted_centers = _fit_progression_subset(centers_x, module_count, pitch)
-        if fitted_centers is None:
-            continue
+    for variant_name, variant in _iter_row_localization_variants(gray):
+        for response_name, response in _build_reconstruction_responses(variant):
+            for quantile in (0.88, 0.9, 0.92):
+                threshold_value = np.quantile(response, quantile)
+                binary = (response >= threshold_value).astype(np.uint8)
+                binary = cv2.morphologyEx(
+                    binary, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+                )
+                component_count, _, stats, centroids = cv2.connectedComponentsWithStats(binary, 8)
 
-        x0 = int(max(min(fitted_centers) - 2.0 * pitch, 0))
-        x1 = int(min(max(fitted_centers) + 1.8 * pitch, gray.shape[1]))
-        y0 = int(max(row["y_mean"] - 1.5 * pitch, 0))
-        y1 = int(min(row["y_mean"] + (module_count + 1.5) * pitch, gray.shape[0]))
-        if x1 - x0 < 140 or y1 - y0 < 140:
-            continue
-        crop = gray[y0:y1, x0:x1]
-        proposals.append((float(crop.shape[0] * crop.shape[1]), f"row20-{row_index}", crop))
+                points.clear()
+                for index in range(1, component_count):
+                    area = int(stats[index, cv2.CC_STAT_AREA])
+                    if 3 <= area <= 120:
+                        x, y = centroids[index]
+                        points.append((float(x), float(y)))
 
-    return proposals
+                for row_index, row in enumerate(_cluster_rows(points, tolerance=6.0)):
+                    centers_x = _dedupe_x([point[0] for point in row["pts"]])
+                    if not (module_count - 2 <= len(centers_x) <= module_count + 2):
+                        continue
+                    pitch_samples = np.diff(centers_x)
+                    pitch_samples = pitch_samples[(pitch_samples > 8.0) & (pitch_samples < 18.0)]
+                    if len(pitch_samples) < 6:
+                        continue
+                    pitch = float(np.median(pitch_samples))
+                    if not 10.0 <= pitch <= 16.0:
+                        continue
+                    fitted_centers = _fit_progression_subset(centers_x, module_count, pitch)
+                    if fitted_centers is None:
+                        continue
+
+                    x0 = int(max(min(fitted_centers) - 2.0 * pitch, 0))
+                    x1 = int(min(max(fitted_centers) + 1.8 * pitch, variant.shape[1]))
+                    y0 = int(max(row["y_mean"] - 1.5 * pitch, 0))
+                    y1 = int(min(row["y_mean"] + (module_count + 1.5) * pitch, variant.shape[0]))
+                    if x1 - x0 < 140 or y1 - y0 < 140:
+                        continue
+                    crop = variant[y0:y1, x0:x1]
+                    proposals.append(
+                        (
+                            float(crop.shape[0] * crop.shape[1]),
+                            f"row20-{variant_name}-{response_name}-{quantile:.2f}-{row_index}",
+                            crop,
+                        )
+                    )
+
+        if proposals:
+            break
+
+    return proposals[:8]
+
+
+def _iter_row_localization_variants(gray: np.ndarray) -> list[tuple[str, np.ndarray]]:
+    variants: list[tuple[str, np.ndarray]] = [("base", gray)]
+    for angle in (-10.0, -7.0, -4.0, 4.0, 7.0, 10.0):
+        variants.append((f"rot{angle:+.0f}", _rotate_image_bound(gray, angle)))
+    return variants
 
 
 def _cluster_rows(points: Iterable[tuple[float, float]], tolerance: float = 4.5) -> list[dict[str, object]]:
@@ -325,6 +340,42 @@ def _fit_progression_subset(
     if best_score < module_count - 3:
         return None
     return best_progression
+
+
+def _rotate_image_bound(image: np.ndarray, angle: float) -> np.ndarray:
+    height, width = image.shape[:2]
+    center = (width / 2.0, height / 2.0)
+    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+    cos = abs(matrix[0, 0])
+    sin = abs(matrix[0, 1])
+    bound_w = int((height * sin) + (width * cos))
+    bound_h = int((height * cos) + (width * sin))
+    matrix[0, 2] += (bound_w / 2) - center[0]
+    matrix[1, 2] += (bound_h / 2) - center[1]
+    return cv2.warpAffine(
+        image,
+        matrix,
+        (bound_w, bound_h),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+
+
+def _build_reconstruction_responses(roi: np.ndarray) -> list[tuple[str, np.ndarray]]:
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(roi)
+    sharpen = cv2.addWeighted(clahe, 1.8, cv2.GaussianBlur(clahe, (0, 0), 1.0), -0.8, 0)
+    tophat = cv2.morphologyEx(
+        sharpen, cv2.MORPH_TOPHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    ).astype(np.float32)
+    blackhat = cv2.morphologyEx(
+        sharpen, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    ).astype(np.float32)
+
+    return [
+        ("mix", cv2.normalize(0.65 * tophat + 0.35 * blackhat, None, 0, 1, cv2.NORM_MINMAX)),
+        ("tophat", cv2.normalize(tophat, None, 0, 1, cv2.NORM_MINMAX)),
+        ("blackhat", cv2.normalize(blackhat, None, 0, 1, cv2.NORM_MINMAX)),
+    ]
 
 
 def _extract_deskewed_roi(gray: np.ndarray, rect: tuple) -> np.ndarray | None:
@@ -461,66 +512,66 @@ def _reconstruct_datamatrix_candidates(
     if min(roi.shape[:2]) < 180:
         return []
 
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(roi)
-    sharpen = cv2.addWeighted(clahe, 1.8, cv2.GaussianBlur(clahe, (0, 0), 1.0), -0.8, 0)
-    tophat = cv2.morphologyEx(
-        sharpen, cv2.MORPH_TOPHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    ).astype(np.float32)
-    blackhat = cv2.morphologyEx(
-        sharpen, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    ).astype(np.float32)
-    response = cv2.normalize(0.65 * tophat + 0.35 * blackhat, None, 0, 1, cv2.NORM_MINMAX)
-
-    strip_height = max(16, min(28, roi.shape[0] // 12))
-    top_projection = response[:strip_height, :].mean(axis=0)
-    min_distance = max(8, roi.shape[1] // 36)
-    threshold = float(np.quantile(top_projection, 0.75))
-    top_centers = np.array(
-        _find_peaks_1d(top_projection, min_dist=min_distance, threshold=threshold),
-        dtype=np.float32,
-    )
-
-    if len(top_centers) != module_count:
-        return []
-
-    pitch_samples = np.diff(top_centers)
-    if not len(pitch_samples):
-        return []
-    base_pitch = float(np.median(pitch_samples))
-    if not 10.0 <= base_pitch <= 16.0:
-        return []
-
     reconstructed: list[tuple[str, np.ndarray, list[str]]] = []
-    max_vertical_offset = max(12, int(base_pitch * 2.3))
-    vertical_offsets = range(2, max_vertical_offset + 1, 2)
+    for response_name, response in _build_reconstruction_responses(roi):
+        strip_height = max(16, min(28, roi.shape[0] // 12))
+        top_projection = response[:strip_height, :].mean(axis=0)
+        min_distance = max(8, roi.shape[1] // 36)
 
-    for vertical_offset in vertical_offsets:
-        for pitch in (
-            base_pitch - 0.4,
-            base_pitch - 0.2,
-            base_pitch,
-            base_pitch + 0.2,
-            base_pitch + 0.4,
-        ):
-            for shear in (-1.2, -1.0, -0.8, -0.6, -0.4, -0.2, 0.0):
-                scores = np.zeros((module_count, module_count), dtype=np.float32)
-                if not _fill_reconstruction_scores(scores, response, top_centers, vertical_offset, pitch, shear):
-                    continue
+        for projection_quantile in (0.65, 0.7, 0.75, 0.8):
+            threshold = float(np.quantile(top_projection, projection_quantile))
+            top_centers = np.array(
+                _find_peaks_1d(top_projection, min_dist=min_distance, threshold=threshold),
+                dtype=np.float32,
+            )
+            if not (module_count - 2 <= len(top_centers) <= module_count + 2):
+                continue
 
-                for quantile in (0.45, 0.5, 0.55, 0.6, 0.65):
-                    threshold_value = float(np.quantile(scores, quantile))
-                    bits = (scores >= threshold_value).astype(np.uint8)
-                    bits[0, :] = 1
-                    bits[:, 0] = 1
-                    _, oriented = _orient_bits(bits)
-                    rendered = _render_bits(oriented)
-                    decoded = _decode_pure_render(rendered)
-                    if decoded:
-                        stage_name = (
-                            f"{roi_name}:reconstruct:y{vertical_offset}:p{pitch:.2f}:"
-                            f"s{shear:.2f}:q{quantile:.2f}"
-                        )
-                        reconstructed.append((stage_name, rendered, decoded))
+            pitch_samples = np.diff(top_centers)
+            pitch_samples = pitch_samples[(pitch_samples > 8.0) & (pitch_samples < 18.0)]
+            if len(pitch_samples) < 6:
+                continue
+            base_pitch = float(np.median(pitch_samples))
+            if not 10.0 <= base_pitch <= 16.0:
+                continue
+
+            fitted_centers = _fit_progression_subset(top_centers.tolist(), module_count, base_pitch)
+            if fitted_centers is None:
+                continue
+            top_centers = np.array(fitted_centers, dtype=np.float32)
+
+            max_vertical_offset = max(12, int(base_pitch * 2.3))
+            vertical_offsets = range(2, max_vertical_offset + 1, 2)
+
+            for vertical_offset in vertical_offsets:
+                for pitch in (
+                    base_pitch - 0.4,
+                    base_pitch - 0.2,
+                    base_pitch,
+                    base_pitch + 0.2,
+                    base_pitch + 0.4,
+                ):
+                    for shear in (-1.4, -1.2, -1.0, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2):
+                        scores = np.zeros((module_count, module_count), dtype=np.float32)
+                        if not _fill_reconstruction_scores(
+                            scores, response, top_centers, vertical_offset, pitch, shear
+                        ):
+                            continue
+
+                        for quantile in (0.45, 0.5, 0.55, 0.6, 0.65):
+                            threshold_value = float(np.quantile(scores, quantile))
+                            bits = (scores >= threshold_value).astype(np.uint8)
+                            bits[0, :] = 1
+                            bits[:, 0] = 1
+                            _, oriented = _orient_bits(bits)
+                            rendered = _render_bits(oriented)
+                            decoded = _decode_pure_render(rendered)
+                            if decoded:
+                                stage_name = (
+                                    f"{roi_name}:reconstruct:{response_name}:pq{projection_quantile:.2f}:"
+                                    f"y{vertical_offset}:p{pitch:.2f}:s{shear:.2f}:q{quantile:.2f}"
+                                )
+                                reconstructed.append((stage_name, rendered, decoded))
 
     return reconstructed[:12]
 
