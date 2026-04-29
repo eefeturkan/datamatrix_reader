@@ -1,0 +1,15 @@
+origin=(91.955,51.579)
+vx=(15.765,1.047)
+vy=(-1.394,15.939)
+truth_decode=['#8B3886177B ###=0302604331701S']
+q44=[]
+q46=[]
+q48=[]
+q48_local_search=['#8B3886177B ###=0302604331701S'] depth=2 flips=[(16, 6), (7, 9)]
+q50=[]
+q50_local_search=[] not_found
+q52=[]
+q54=[]
+q56=[]
+final_decode=['#8B3886177B ###=0302604331701S']
+final_decode_note=q48 depth=2 flips=[(16, 6), (7, 9)]

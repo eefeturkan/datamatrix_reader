@@ -27,8 +27,9 @@ Thumbs.db
 
 # Tool/runtime folders
 .playwright-mcp/
+artifacts/playwright-mcp/
 
 # Local debug outputs
 debug/
-cropped.png
+artifacts/previews/
 test*.png

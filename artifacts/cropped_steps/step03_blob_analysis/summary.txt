@@ -1,0 +1,11 @@
+truth_count=201
+hough_gray_inv: count=314 matched=177 precision=0.564 recall=0.881 f1=0.687
+hough_median_dark: count=251 matched=146 precision=0.582 recall=0.726 f1=0.646
+blob_matched_circ: count=367 matched=160 precision=0.436 recall=0.796 f1=0.563
+blob_matched_loose: count=406 matched=159 precision=0.392 recall=0.791 f1=0.524
+blob_blackhat_loose: count=467 matched=171 precision=0.366 recall=0.851 f1=0.512
+blob_gray_inv_loose: count=475 matched=169 precision=0.356 recall=0.841 f1=0.500
+blob_median_dark_loose: count=530 matched=174 precision=0.328 recall=0.866 f1=0.476
+blob_gray_inv_circ: count=139 matched=80 precision=0.576 recall=0.398 f1=0.471
+hough_matched: count=268 matched=109 precision=0.407 recall=0.542 f1=0.465
+blob_median_dark_circ: count=110 matched=40 precision=0.364 recall=0.199 f1=0.257

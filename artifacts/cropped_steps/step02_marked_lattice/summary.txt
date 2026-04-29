@@ -1,0 +1,12 @@
+point_count=201
+origin=(77.000,51.000)
+vx=(15.601,0.975) len=15.631
+vy=(-1.301,16.055) len=16.108
+score=257.429
+seed_ax=3.576
+seed_ay=94.631
+q=0.48 decode=[]
+q=0.50 decode=[]
+q=0.52 decode=[]
+q=0.54 decode=[]
+q=0.56 decode=[]

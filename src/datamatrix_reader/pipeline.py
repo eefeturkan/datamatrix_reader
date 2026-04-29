@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 from io import BytesIO
+import itertools
 import math
 from typing import Iterable
 
@@ -109,10 +110,28 @@ _FULL_RECONSTRUCTION = _ReconstructionProfile(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _BrightGridCandidate:
+    stage_name: str
+    bits: np.ndarray
+    score_grid: np.ndarray
+    threshold_value: float
+    score: float
+
+
+@dataclass(frozen=True, slots=True)
+class _BrightFrameFit:
+    score: float
+    origin: np.ndarray
+    vx: np.ndarray
+    vy: np.ndarray
+
+
 def decode_image(image_bytes: bytes) -> DecodeResult:
     bgr = _load_image(image_bytes)
     raw_grayscale = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     grayscale = _normalize_grayscale(bgr)
+    bright_fallback_candidates: list[_ImageCandidate] = []
 
     for roi_candidates, fast_only in (
         (_generate_roi_candidates(raw_grayscale, fast_only=True), True),
@@ -164,7 +183,22 @@ def decode_image(image_bytes: bytes) -> DecodeResult:
             alternatives=alternatives,
         )
 
-    fallback = max(image_candidates, key=lambda item: (item.preview_score, item.structural_score))
+    if _looks_like_bright_dotpeen(raw_grayscale):
+        bright_fallback_candidates, bright_hits = _build_bright_background_candidates(raw_grayscale)
+        if bright_hits:
+            primary, alternatives = _rank_hits(bright_hits)
+            processed_image = _find_stage_image(bright_fallback_candidates, primary.stage_name)
+            return DecodeResult(
+                text=primary.text,
+                engine=primary.engine,
+                stage_name=primary.stage_name,
+                score=primary.score,
+                processed_image=processed_image,
+                alternatives=alternatives,
+            )
+
+    fallback_pool = [*image_candidates, *bright_fallback_candidates]
+    fallback = max(fallback_pool, key=lambda item: (item.preview_score, item.structural_score))
     return DecodeResult(
         text=None,
         engine=None,
@@ -931,6 +965,587 @@ def _bit_distance(left: np.ndarray, right: np.ndarray) -> int:
     if left.shape != right.shape:
         return max(left.size, right.size)
     return int(np.count_nonzero(left != right))
+
+
+def _looks_like_bright_dotpeen(gray: np.ndarray) -> bool:
+    return float(np.mean(gray)) >= 110.0 and float(np.std(gray)) >= 20.0
+
+
+def _build_bright_background_candidates(
+    gray: np.ndarray,
+) -> tuple[list[_ImageCandidate], list[_DecodeHit]]:
+    bright_candidates = _search_bright_frame_candidates(gray)
+    if not bright_candidates:
+        return [], []
+
+    image_candidates: list[_ImageCandidate] = []
+    hits: list[_DecodeHit] = []
+
+    for candidate in bright_candidates[:6]:
+        rendered = _render_bits(candidate.bits)
+        preview_score = candidate.score * 10.0
+        structural_score = candidate.score * 10.0
+        image_candidates.append(
+            _ImageCandidate(
+                stage_name=candidate.stage_name,
+                image=rendered,
+                preview_score=preview_score,
+                structural_score=structural_score,
+            )
+        )
+
+        decoded_texts = _decode_direct_render(rendered)
+        if not decoded_texts:
+            decoded_texts = _decode_bright_uncertain_cells(candidate)
+
+        for text in decoded_texts:
+            hits.append(
+                _DecodeHit(
+                    text=text,
+                    engine="zxingcpp-bright-reconstruct",
+                    stage_name=candidate.stage_name,
+                    valid=True,
+                    readable_ratio=_readable_ratio(text),
+                    preview_score=preview_score,
+                    structural_score=structural_score,
+                )
+            )
+
+    return image_candidates, hits
+
+
+def _search_bright_frame_candidates(gray: np.ndarray) -> list[_BrightGridCandidate]:
+    weighted_points, weighted_scores, feature_maps = _build_bright_weighted_points(gray)
+    if weighted_points.size == 0:
+        return []
+
+    best_fit = _fit_best_bright_frame(weighted_points, weighted_scores)
+    if best_fit is None:
+        return []
+
+    vote = _bright_point_vote_scores(weighted_points, weighted_scores, best_fit)
+    vote_norm = vote / (float(vote.max()) + 1e-6)
+    hessian_scores = _sample_bright_channel(feature_maps["hessian"], best_fit, radius=4, reducer="max")
+    fft_scores = _sample_bright_channel(feature_maps["fft"], best_fit, radius=4, reducer="max")
+    dark_scores = _sample_bright_channel(feature_maps["dark"], best_fit, radius=3, reducer="mean")
+    gray_inv_scores = _sample_bright_channel(feature_maps["gray_inv"], best_fit, radius=3, reducer="mean")
+    combined = (
+        0.52 * vote_norm
+        + 0.20 * hessian_scores
+        + 0.14 * fft_scores
+        + 0.08 * dark_scores
+        + 0.06 * gray_inv_scores
+    ).astype(np.float32)
+
+    candidates: list[_BrightGridCandidate] = []
+    for quantile in (0.44, 0.46, 0.48, 0.50, 0.52, 0.54, 0.56):
+        threshold_value = float(np.quantile(combined, quantile))
+        bits = (combined >= threshold_value).astype(np.uint8)
+        candidates.append(
+            _BrightGridCandidate(
+                stage_name=(
+                    f"bright-frame:x{best_fit.origin[0]:.1f}:y{best_fit.origin[1]:.1f}:"
+                    f"vx{best_fit.vx[0]:.2f},{best_fit.vx[1]:.2f}:"
+                    f"vy{best_fit.vy[0]:.2f},{best_fit.vy[1]:.2f}:q{quantile:.2f}"
+                ),
+                bits=bits,
+                score_grid=combined,
+                threshold_value=threshold_value,
+                score=best_fit.score,
+            )
+        )
+    return candidates
+
+
+def _search_bright_grid_candidates(gray: np.ndarray) -> list[_BrightGridCandidate]:
+    responses = _build_bright_dot_responses(gray)
+    if not responses:
+        return []
+
+    module_count = 20
+    height, width = gray.shape
+    seed_x0 = width * (63.0 / 464.0)
+    seed_y0 = height * (18.0 / 423.0)
+    seed_x_pitch = width * (((388.0 - 63.0) / 19.0) / 464.0)
+    seed_y_pitch = height * (((366.0 - 18.0) / 19.0) / 423.0)
+
+    candidates: list[_BrightGridCandidate] = []
+    seen: set[bytes] = set()
+
+    x0_values = np.arange(seed_x0 - 4.0, seed_x0 + 4.1, 1.0)
+    y0_values = np.arange(seed_y0 - 4.0, seed_y0 + 4.1, 1.0)
+    x_pitch_values = np.arange(seed_x_pitch - 0.9, seed_x_pitch + 0.91, 0.3)
+    y_pitch_values = np.arange(seed_y_pitch - 0.9, seed_y_pitch + 0.91, 0.3)
+    quantiles = (0.25, 0.35, 0.45, 0.55)
+
+    max_per_response = 12
+    for response_name, response in responses[:4]:
+        local_count = 0
+        for x0 in x0_values:
+            for y0 in y0_values:
+                for x_pitch in x_pitch_values:
+                    for y_pitch in y_pitch_values:
+                        score_grid = np.zeros((module_count, module_count), dtype=np.float32)
+                        if not _fill_bright_score_grid(score_grid, response, x0, y0, x_pitch, y_pitch):
+                            continue
+
+                        top_mean = float(np.mean(score_grid[0, :]))
+                        left_mean = float(np.mean(score_grid[:, 0]))
+                        bottom_mean = float(np.mean(score_grid[-1, :]))
+                        for quantile in quantiles:
+                            threshold_value = float(np.quantile(score_grid, quantile))
+                            bits = (score_grid >= threshold_value).astype(np.uint8)
+                            bits[0, :] = 1
+                            bits[:, 0] = 1
+                            orient_score, oriented = _orient_bits(bits)
+                            occupancy = float(oriented.mean())
+                            score = (
+                                orient_score
+                                + top_mean
+                                + left_mean
+                                + bottom_mean
+                                - abs(occupancy - 0.5) * 1.5
+                            )
+                            key = oriented.tobytes()
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            candidates.append(
+                                _BrightGridCandidate(
+                                    stage_name=(
+                                        f"bright:{response_name}:x0{x0:.1f}:y0{y0:.1f}:"
+                                        f"xp{x_pitch:.2f}:yp{y_pitch:.2f}:q{quantile:.2f}"
+                                    ),
+                                    bits=oriented.copy(),
+                                    score_grid=score_grid.copy(),
+                                    threshold_value=threshold_value,
+                                    score=score,
+                                )
+                            )
+                            local_count += 1
+                            if local_count >= max_per_response:
+                                break
+                        if local_count >= max_per_response:
+                            break
+                    if local_count >= max_per_response:
+                        break
+                if local_count >= max_per_response:
+                    break
+            if local_count >= max_per_response:
+                break
+
+    candidates.sort(key=lambda item: item.score, reverse=True)
+    return candidates[:24]
+
+
+def _build_bright_weighted_points(
+    gray: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    dark_lcn = _bright_dark_lcn(gray)
+    dark_u8 = cv2.normalize(dark_lcn, None, 0, 1, cv2.NORM_MINMAX).astype(np.float32)
+    gray_inv = ((255 - gray).astype(np.float32) / 255.0).astype(np.float32)
+    hough = _bright_hough_centers((255 - gray).astype(np.uint8))
+    hessian = _bright_topk_points(_bright_hessian_blob_multi(dark_lcn), 220)
+    fft = _bright_topk_points(_bright_fft_best_map(dark_lcn), 220)
+
+    points: list[np.ndarray] = []
+    weights: list[float] = []
+    for point in hough:
+        points.append(point)
+        weights.append(1.0)
+    for point in hessian:
+        points.append(point)
+        weights.append(0.85)
+    for point in fft:
+        points.append(point)
+        weights.append(0.80)
+
+    if not points:
+        return np.empty((0, 2), dtype=np.float32), np.empty((0,), dtype=np.float32), {}
+
+    merged_points, merged_weights = _merge_bright_points(
+        np.array(points, dtype=np.float32),
+        np.array(weights, dtype=np.float32),
+        radius=5.5,
+    )
+    return merged_points, merged_weights, {
+        "dark": dark_u8,
+        "gray_inv": gray_inv,
+        "hessian": _bright_hessian_blob_multi(dark_lcn).astype(np.float32) / 255.0,
+        "fft": _bright_fft_best_map(dark_lcn).astype(np.float32) / 255.0,
+    }
+
+
+def _bright_dark_lcn(gray: np.ndarray) -> np.ndarray:
+    gray_f = gray.astype(np.float32) / 255.0
+    mean = cv2.GaussianBlur(gray_f, (0, 0), 41 / 6.0)
+    mean_sq = cv2.GaussianBlur(gray_f * gray_f, (0, 0), 41 / 6.0)
+    std = np.sqrt(np.maximum(mean_sq - mean * mean, 0.0))
+    lcn = (gray_f - mean) / (std + 1e-3)
+    return np.clip(-lcn, 0.0, None).astype(np.float32)
+
+
+def _bright_hessian_blob_multi(dark_lcn: np.ndarray) -> np.ndarray:
+    maps: list[np.ndarray] = []
+    for sigma in (1.4, 1.8, 2.2, 2.8):
+        smooth = cv2.GaussianBlur(dark_lcn, (0, 0), sigmaX=sigma, sigmaY=sigma)
+        dxx = cv2.Sobel(smooth, cv2.CV_32F, 2, 0, ksize=3)
+        dyy = cv2.Sobel(smooth, cv2.CV_32F, 0, 2, ksize=3)
+        dxy = cv2.Sobel(smooth, cv2.CV_32F, 1, 1, ksize=3)
+        det = dxx * dyy - dxy * dxy
+        trace = dxx + dyy
+        disc = np.sqrt(np.maximum(trace * trace - 4.0 * det, 0.0))
+        l1 = 0.5 * (trace + disc)
+        l2 = 0.5 * (trace - disc)
+        same_sign = (l1 > 0) & (l2 > 0)
+        isotropy = np.minimum(np.abs(l1), np.abs(l2)) / (np.maximum(np.abs(l1), np.abs(l2)) + 1e-6)
+        blobness = np.where(same_sign, np.sqrt(np.maximum(det, 0.0)) * isotropy, 0.0)
+        maps.append(cv2.normalize(blobness, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8))
+    return np.max(np.stack(maps, axis=0), axis=0).astype(np.uint8)
+
+
+def _bright_fft_best_map(dark_lcn: np.ndarray) -> np.ndarray:
+    height, width = dark_lcn.shape
+    freq_y = np.fft.fftfreq(height)
+    freq_x = np.fft.fftfreq(width)
+    grid_x, grid_y = np.meshgrid(freq_x, freq_y)
+    radial = np.sqrt(grid_x * grid_x + grid_y * grid_y)
+    center_freq = 1.0 / 17.0
+    width_sigma = 0.014
+    mask = np.exp(-0.5 * ((radial - center_freq) / width_sigma) ** 2)
+    spectrum = np.fft.fft2(dark_lcn)
+    recon = np.fft.ifft2(spectrum * mask)
+    amplitude = np.abs(recon)
+    return cv2.normalize(amplitude, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+
+def _bright_hough_centers(gray_inv: np.ndarray) -> np.ndarray:
+    blurred = cv2.medianBlur(gray_inv, 5)
+    circles = cv2.HoughCircles(
+        blurred,
+        cv2.HOUGH_GRADIENT,
+        1.0,
+        10,
+        param1=80,
+        param2=10,
+        minRadius=2,
+        maxRadius=8,
+    )
+    if circles is None:
+        return np.empty((0, 2), dtype=np.float32)
+    return np.round(circles[0, :, :2]).astype(np.float32)
+
+
+def _bright_topk_points(map_u8: np.ndarray, count: int, min_dist: float = 8.0) -> np.ndarray:
+    rows, cols = np.where(map_u8 > 0)
+    scores = map_u8[rows, cols].astype(np.float32)
+    order = np.argsort(scores)[::-1]
+    selected: list[tuple[float, float]] = []
+    min_dist_sq = min_dist * min_dist
+    for index in order:
+        x = float(cols[index])
+        y = float(rows[index])
+        if all((x - px) ** 2 + (y - py) ** 2 > min_dist_sq for px, py in selected):
+            selected.append((x, y))
+            if len(selected) >= count:
+                break
+    return np.array(selected, dtype=np.float32)
+
+
+def _merge_bright_points(
+    points: np.ndarray,
+    weights: np.ndarray,
+    radius: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    order = np.argsort(weights)[::-1]
+    kept_points: list[np.ndarray] = []
+    kept_weights: list[float] = []
+    radius_sq = radius * radius
+    for index in order:
+        point = points[index]
+        weight = float(weights[index])
+        merged = False
+        for candidate_index, kept_point in enumerate(kept_points):
+            if float(np.sum((point - kept_point) ** 2)) <= radius_sq:
+                total = kept_weights[candidate_index] + weight
+                kept_points[candidate_index] = (kept_point * kept_weights[candidate_index] + point * weight) / total
+                kept_weights[candidate_index] = total
+                merged = True
+                break
+        if not merged:
+            kept_points.append(point.copy())
+            kept_weights.append(weight)
+    return np.array(kept_points, dtype=np.float32), np.array(kept_weights, dtype=np.float32)
+
+
+def _bright_candidate_bases() -> list[tuple[np.ndarray, np.ndarray]]:
+    bases: list[tuple[np.ndarray, np.ndarray]] = []
+    for angle_x in (3.0, 3.8, 4.6):
+        for angle_y in (95.0, 96.5, 98.0):
+            for scale_x in (15.8, 16.2):
+                for scale_y in (16.0, 16.6):
+                    vx = np.array(
+                        [math.cos(math.radians(angle_x)) * scale_x, math.sin(math.radians(angle_x)) * scale_x],
+                        dtype=np.float32,
+                    )
+                    vy = np.array(
+                        [math.cos(math.radians(angle_y)) * scale_y, math.sin(math.radians(angle_y)) * scale_y],
+                        dtype=np.float32,
+                    )
+                    bases.append((vx, vy))
+    return bases
+
+
+def _fit_best_bright_frame(points: np.ndarray, weights: np.ndarray) -> _BrightFrameFit | None:
+    best: _BrightFrameFit | None = None
+    for vx, vy in _bright_candidate_bases():
+        fit = _fit_bright_edges(points, weights, vx, vy)
+        if fit is not None and (best is None or fit.score > best.score):
+            best = fit
+    return best
+
+
+def _fit_bright_edges(
+    points: np.ndarray,
+    weights: np.ndarray,
+    vx: np.ndarray,
+    vy: np.ndarray,
+) -> _BrightFrameFit | None:
+    basis = np.column_stack((vx, vy))
+    inv = np.linalg.inv(basis)
+    coords = points @ inv.T
+    best: _BrightFrameFit | None = None
+
+    for offset_u in np.linspace(0.0, 0.92, 12):
+        for offset_v in np.linspace(0.0, 0.92, 12):
+            shifted = coords - np.array([offset_u, offset_v], dtype=np.float32)
+            rounded = np.rint(shifted)
+            error = np.linalg.norm(shifted - rounded, axis=1)
+            good = error <= 0.34
+            if int(np.sum(good)) < 120:
+                continue
+
+            ij = rounded[good].astype(np.int32)
+            fit_weights = weights[good]
+            min_i, max_i = int(ij[:, 0].min()), int(ij[:, 0].max())
+            min_j, max_j = int(ij[:, 1].min()), int(ij[:, 1].max())
+            if max_i - min_i < 19 or max_j - min_j < 19:
+                continue
+
+            i_scores: list[tuple[float, int]] = []
+            for left in range(min_i, max_i - 18):
+                right = left + 19
+                i_scores.append(
+                    (
+                        float(fit_weights[ij[:, 0] == left].sum()) + float(fit_weights[ij[:, 0] == right].sum()),
+                        left,
+                    )
+                )
+            j_scores: list[tuple[float, int]] = []
+            for top in range(min_j, max_j - 18):
+                bottom = top + 19
+                j_scores.append(
+                    (
+                        float(fit_weights[ij[:, 1] == top].sum()) + float(fit_weights[ij[:, 1] == bottom].sum()),
+                        top,
+                    )
+                )
+            top_lefts = [left for _, left in sorted(i_scores, reverse=True)[:5]]
+            top_tops = [top for _, top in sorted(j_scores, reverse=True)[:5]]
+
+            for left in top_lefts:
+                right = left + 19
+                within_i = (ij[:, 0] >= left) & (ij[:, 0] <= right)
+                if np.sum(within_i) < 70:
+                    continue
+                for top in top_tops:
+                    bottom = top + 19
+                    in_box = within_i & (ij[:, 1] >= top) & (ij[:, 1] <= bottom)
+                    if np.sum(in_box) < 90:
+                        continue
+                    box_ij = ij[in_box]
+                    box_weights = fit_weights[in_box]
+                    edge_score = (
+                        float(box_weights[box_ij[:, 0] == left].sum())
+                        + float(box_weights[box_ij[:, 0] == right].sum())
+                        + float(box_weights[box_ij[:, 1] == top].sum())
+                        + float(box_weights[box_ij[:, 1] == bottom].sum())
+                    )
+                    inside_score = float(box_weights.sum())
+                    outside_score = float(fit_weights[~in_box].sum())
+                    score = 8.0 * edge_score + 0.8 * inside_score - 0.85 * outside_score
+                    origin = np.array([left + offset_u, top + offset_v], dtype=np.float32) @ basis.T
+                    fit = _BrightFrameFit(
+                        score=score,
+                        origin=origin.astype(np.float32),
+                        vx=vx,
+                        vy=vy,
+                    )
+                    if best is None or fit.score > best.score:
+                        best = fit
+    return best
+
+
+def _bright_point_vote_scores(points: np.ndarray, weights: np.ndarray, fit: _BrightFrameFit) -> np.ndarray:
+    basis = np.column_stack((fit.vx, fit.vy))
+    inv = np.linalg.inv(basis)
+    local = (points - fit.origin[None, :]) @ inv.T
+    rounded = np.rint(local)
+    error = np.linalg.norm(local - rounded, axis=1)
+    good = error <= 0.34
+    ij = rounded[good].astype(np.int32)
+    effective_weights = weights[good] * (1.0 - error[good] / 0.34)
+    score = np.zeros((20, 20), dtype=np.float32)
+    for (col, row), weight in zip(ij, effective_weights):
+        if 0 <= row < 20 and 0 <= col < 20:
+            score[row, col] += float(weight)
+    return score
+
+
+def _sample_bright_channel(
+    channel: np.ndarray,
+    fit: _BrightFrameFit,
+    radius: int,
+    reducer: str,
+) -> np.ndarray:
+    height, width = channel.shape[:2]
+    score = np.zeros((20, 20), dtype=np.float32)
+    for row in range(20):
+        for col in range(20):
+            point = fit.origin + col * fit.vx + row * fit.vy
+            center_x = int(round(float(point[0])))
+            center_y = int(round(float(point[1])))
+            x0 = max(0, center_x - radius)
+            y0 = max(0, center_y - radius)
+            x1 = min(width, center_x + radius + 1)
+            y1 = min(height, center_y + radius + 1)
+            patch = channel[y0:y1, x0:x1]
+            if patch.size == 0:
+                continue
+            score[row, col] = float(patch.mean()) if reducer == "mean" else float(patch.max())
+    return score
+
+
+def _build_bright_dot_responses(gray: np.ndarray) -> list[tuple[str, np.ndarray]]:
+    smoothed = cv2.bilateralFilter(gray, 9, 75, 75)
+    responses: list[tuple[str, np.ndarray]] = []
+
+    for kernel_size in (21, 31):
+        background = cv2.medianBlur(smoothed, kernel_size)
+        dark = cv2.subtract(background, smoothed)
+        dark_norm = cv2.normalize(dark, None, 0, 1, cv2.NORM_MINMAX).astype(np.float32)
+        responses.append((f"median_dark_{kernel_size}", dark_norm))
+
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(smoothed)
+    sharpened = cv2.addWeighted(clahe, 1.8, cv2.GaussianBlur(clahe, (0, 0), 1.0), -0.8, 0)
+    tophat = cv2.morphologyEx(
+        sharpened,
+        cv2.MORPH_TOPHAT,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+    ).astype(np.float32)
+    blackhat = cv2.morphologyEx(
+        sharpened,
+        cv2.MORPH_BLACKHAT,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+    ).astype(np.float32)
+    responses.append(("smooth_blackhat", cv2.normalize(blackhat, None, 0, 1, cv2.NORM_MINMAX)))
+    responses.append(("smooth_mix", cv2.normalize(0.65 * tophat + 0.35 * blackhat, None, 0, 1, cv2.NORM_MINMAX)))
+
+    for radius in (4, 5, 6, 7):
+        outer = np.zeros((2 * radius + 3, 2 * radius + 3), dtype=np.float32)
+        inner = np.zeros_like(outer)
+        cv2.circle(outer, (radius + 1, radius + 1), radius + 1, 1.0, -1)
+        cv2.circle(inner, (radius + 1, radius + 1), max(1, radius - 1), 1.0, -1)
+        ring = outer - inner
+        inner_sum = float(inner.sum())
+        ring_sum = float(ring.sum())
+        if inner_sum <= 0 or ring_sum <= 0:
+            continue
+        matched = cv2.filter2D(smoothed.astype(np.float32), cv2.CV_32F, inner / inner_sum) - cv2.filter2D(
+            smoothed.astype(np.float32), cv2.CV_32F, ring / ring_sum
+        )
+        signal = np.clip(matched, 0, None)
+        normalized = cv2.normalize(signal, None, 0, 1, cv2.NORM_MINMAX)
+        if normalized is not None and float(np.std(normalized)) > 0.05:
+            responses.append((f"matched_r{radius}_pos", normalized.astype(np.float32)))
+
+    return responses
+
+
+def _fill_bright_score_grid(
+    score_grid: np.ndarray,
+    response: np.ndarray,
+    x0: float,
+    y0: float,
+    x_pitch: float,
+    y_pitch: float,
+) -> bool:
+    for row in range(score_grid.shape[0]):
+        center_y = int(round(y0 + row * y_pitch))
+        if center_y < 0 or center_y >= response.shape[0]:
+            return False
+        for col in range(score_grid.shape[1]):
+            center_x = int(round(x0 + col * x_pitch))
+            if center_x < 0 or center_x >= response.shape[1]:
+                return False
+            patch = response[
+                max(0, center_y - 4) : min(response.shape[0], center_y + 5),
+                max(0, center_x - 4) : min(response.shape[1], center_x + 5),
+            ]
+            score_grid[row, col] = float(patch.max()) if patch.size else 0.0
+    return True
+
+
+def _decode_bright_uncertain_cells(candidate: _BrightGridCandidate) -> list[str]:
+    decoded: list[str] = []
+    margins = np.abs(candidate.score_grid - candidate.threshold_value)
+    uncertain_cells: list[tuple[float, int, int]] = []
+    for row in range(candidate.score_grid.shape[0]):
+        for col in range(candidate.score_grid.shape[1]):
+            uncertain_cells.append((float(margins[row, col]), row, col))
+    uncertain_cells.sort(key=lambda item: item[0])
+    top_cells = [(row, col) for _, row, col in uncertain_cells[:18]]
+
+    rendered = _render_bits(candidate.bits)
+    decoded = _decode_direct_render(rendered)
+    if decoded:
+        return decoded
+
+    for depth in (1, 2, 3):
+        limit = 40_000
+        for count, combo in enumerate(itertools.combinations(range(len(top_cells)), depth), start=1):
+            trial = candidate.bits.copy()
+            for index in combo:
+                row, col = top_cells[index]
+                trial[row, col] = 1 - trial[row, col]
+            decoded.extend(_decode_direct_render(_render_bits(trial)))
+            if decoded:
+                return sorted(set(decoded))
+            if count >= limit:
+                break
+
+    return []
+
+
+def _decode_direct_render(rendered: np.ndarray) -> list[str]:
+    decoded: list[str] = []
+    for candidate in (rendered, 255 - rendered):
+        try:
+            results = zxingcpp.read_barcodes(
+                candidate,
+                formats=zxingcpp.BarcodeFormat.DataMatrix,
+                try_rotate=True,
+                try_downscale=False,
+                text_mode=zxingcpp.TextMode.Plain,
+            )
+        except TypeError:
+            results = zxingcpp.read_barcodes(candidate)
+
+        for result in results or []:
+            text = (getattr(result, "text", "") or "").strip()
+            if text:
+                decoded.append(text)
+    return sorted(set(decoded))
 
 
 def _decode_pure_render(rendered: np.ndarray) -> list[str]:

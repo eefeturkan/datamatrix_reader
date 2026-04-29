@@ -1,0 +1,6 @@
+truth_count=201
+fft_p17p0_w0p014: count=220 matched=133 precision=0.605 recall=0.662 f1=0.632
+fft_p17p0_h2: count=220 matched=131 precision=0.595 recall=0.652 f1=0.622
+fft_p17p5_h2: count=220 matched=126 precision=0.573 recall=0.627 f1=0.599
+fft_p16p5_w0p010: count=220 matched=117 precision=0.532 recall=0.582 f1=0.556
+fft_p17p0_w0p010: count=220 matched=113 precision=0.514 recall=0.562 f1=0.537

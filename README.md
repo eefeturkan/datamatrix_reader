@@ -38,6 +38,8 @@ Bekleyen ana problem:
 ```text
 app.py
 requirements.txt
+artifacts/
+experiments/
 src/
   datamatrix_reader/
     __init__.py
@@ -46,6 +48,8 @@ src/
 
 Dosyalar:
 - `app.py`: Streamlit arayuzu
+- `experiments/`: tek seferlik debug / arastirma scriptleri
+- `artifacts/`: debug ciktisi, onizleme ve gecici yardimci dosyalar
 - `src/datamatrix_reader/pipeline.py`: tum decode, preprocess, reconstruction ve skor mantigi
 - `src/datamatrix_reader/__init__.py`: public API export
 

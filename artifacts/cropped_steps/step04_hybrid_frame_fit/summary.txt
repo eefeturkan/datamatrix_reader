@@ -1,0 +1,20 @@
+truth_count=201
+hough_count=314
+matched_peak_count=220
+hybrid_count=383
+origin=(40.000,35.000)
+vx=(16.000,0.500) len=16.008 angle=1.790
+vy=(-2.000,14.000) len=14.142 angle=98.130
+score=-411.798
+good_count=121
+mean_err=0.2287
+span_u=27
+span_v=27
+truth_good=74.0000
+truth_mean_err=0.2546
+min_i=4.0000
+max_i=23.0000
+min_j=1.0000
+max_j=23.0000
+right_hits=3.0000
+bottom_hits=4.0000

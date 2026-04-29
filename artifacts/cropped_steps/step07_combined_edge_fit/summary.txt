@@ -1,0 +1,17 @@
+point_count=478
+origin=(91.955,51.579)
+vx=(15.765,1.047) len=15.800 angle=3.800
+vy=(-1.394,15.939) len=16.000 angle=95.000
+left=6
+top=2
+score=1283.075
+edge_score=122.250
+inside_score=429.050
+outside_score=44.900
+truth_good=201.000
+truth_edge_good=57.000
+truth_mean_err=0.140
+truth_min_i=0.000
+truth_max_i=19.000
+truth_min_j=0.000
+truth_max_j=19.000
