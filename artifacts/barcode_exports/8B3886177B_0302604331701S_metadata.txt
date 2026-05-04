@@ -1,0 +1,13 @@
+barcode_export
+image=saf.png
+model=best.pt
+decoded_text=#8B3886177B ###=0302604331701S
+safe_name=8B3886177B_0302604331701S
+detection_index=0
+detection_confidence=0.8399
+detection_xyxy=[1677.8, 481.2, 2192.7, 1033.3]
+scale=1.2
+quantile=0.47
+frame_origin=(87.82762145996094, 65.383056640625)
+frame_vx=(19.377382278442383, 1.5590671300888062)
+frame_vy=(-1.7361425161361694, 19.844200134277344)
