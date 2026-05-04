@@ -1,0 +1,6 @@
+od_then_range_grid_decode
+image=1777894375019_saf.png
+model=best.pt
+detections=1
+
+det0: conf=0.8399 xyxy=[1677.8, 481.2, 2192.7, 1033.3] scale=1.2 q=0.47 decoded=['#8B3886177B ###=0302604331701S']
