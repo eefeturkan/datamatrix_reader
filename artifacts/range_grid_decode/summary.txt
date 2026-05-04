@@ -1,0 +1,29 @@
+range_grid_decode
+method=20x20 calibrated grid + 7x7 local range response + 13x13 cell patch p90 + quantile bit threshold
+
+cropped.png
+  q=0.46 occupancy=0.540 decoded=[]
+  q=0.47 occupancy=0.532 decoded=[]
+  q=0.48 occupancy=0.520 decoded=['#8B3886177B ###=0302604331701S']
+  q=0.49 occupancy=0.510 decoded=['#8B3886177B ###=0302604331701S']
+  q=0.50 occupancy=0.500 decoded=['#8B3886177B ###=0302604331701S']
+  q=0.51 occupancy=0.490 decoded=[]
+  q=0.52 occupancy=0.480 decoded=[]
+
+yenitest.png
+  q=0.46 occupancy=0.542 decoded=[]
+  q=0.47 occupancy=0.530 decoded=['#8B3886177B ###=0302604331701S']
+  q=0.48 occupancy=0.522 decoded=['#8B3886177B ###=0302604331701S']
+  q=0.49 occupancy=0.510 decoded=['#8B3886177B ###=0302604331701S']
+  q=0.50 occupancy=0.505 decoded=['#8B3886177B ###=0302604331701S']
+  q=0.51 occupancy=0.490 decoded=[]
+  q=0.52 occupancy=0.485 decoded=[]
+
+yenitest2.png
+  q=0.46 occupancy=0.540 decoded=[]
+  q=0.47 occupancy=0.530 decoded=[]
+  q=0.48 occupancy=0.522 decoded=['#8B3886177B ###=0302604331701S']
+  q=0.49 occupancy=0.510 decoded=['#8B3886177B ###=0302604331701S']
+  q=0.50 occupancy=0.502 decoded=['#8B3886177B ###=0302604331701S']
+  q=0.51 occupancy=0.490 decoded=[]
+  q=0.52 occupancy=0.482 decoded=[]

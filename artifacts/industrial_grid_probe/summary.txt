@@ -1,0 +1,5 @@
+industrial_grid_probe
+method=bright dot likelihood + frame fit + module-count/offset search + Data Matrix border score
+
+cropped.png: modules=20 u0=3.50 v0=-2.00 q=0.42 score=7.107 occupancy=0.580 decoded=[]
+yenitest.png: modules=20 u0=5.00 v0=3.25 q=0.46 score=6.935 occupancy=0.540 decoded=[]
