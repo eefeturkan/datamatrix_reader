@@ -61,7 +61,9 @@ def detect_datamatrix(model_path: Path, image_path: Path, conf: float) -> tuple[
     image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if image is None:
         raise FileNotFoundError(image_path)
-    model = YOLO(str(model_path))
+    if not model_path.exists():
+        raise FileNotFoundError(model_path)
+    model = YOLO(str(model_path), task="detect")
     result = model.predict(str(image_path), conf=conf, verbose=False)[0]
     detections: list[Detection] = []
     if result.boxes is None:
@@ -368,7 +370,7 @@ def run(image_path: Path, model_path: Path, output_dir: Path, conf: float, max_d
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Single-file OD + Data Matrix reader")
     parser.add_argument("--image", required=True, type=Path, help="Input full image path")
-    parser.add_argument("--model", default=Path("best.pt"), type=Path, help="YOLO .pt model path")
+    parser.add_argument("--model", default=Path("best.onnx"), type=Path, help="YOLO .onnx model path")
     parser.add_argument("--out", default=Path("artifacts/single_file_output"), type=Path)
     parser.add_argument("--conf", default=0.15, type=float, help="YOLO confidence threshold")
     parser.add_argument("--max-detections", default=3, type=int, help="Max boxes to try")

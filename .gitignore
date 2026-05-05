@@ -35,3 +35,4 @@ artifacts/previews/
 test*.png
 
 *.pt
+*.onnx
