@@ -1,0 +1,12 @@
+single_file_datamatrix_reader
+image=saf.png
+model=best.onnx
+decoded_text=#8B3886177B ###=0302604331701S
+detection_index=0
+detection_confidence=0.8429
+detection_xyxy=[1677.8, 482.9, 2192.4, 1033.4]
+scale=1.2
+quantile=0.48
+frame_origin=[82.191, 61.234]
+frame_vx=[19.377, 1.559]
+frame_vy=[-1.736, 19.844]

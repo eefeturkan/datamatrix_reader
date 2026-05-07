@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import math
 from pathlib import Path
 import re
 import sys
@@ -86,106 +87,230 @@ def normalize_u8(values: np.ndarray) -> np.ndarray:
     return cv2.normalize(values, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
 
+def local_contrast_normalize(gray: np.ndarray, win: int = 41, eps: float = 1e-3) -> np.ndarray:
+    gray_f = gray.astype(np.float32) / 255.0
+    mu = cv2.GaussianBlur(gray_f, (0, 0), win / 6.0)
+    sq_mu = cv2.GaussianBlur(gray_f * gray_f, (0, 0), win / 6.0)
+    sigma = np.sqrt(np.maximum(sq_mu - mu * mu, 0.0))
+    return (gray_f - mu) / (sigma + eps)
+
+
+def hough_centers(gray_inv: np.ndarray) -> np.ndarray:
+    blur = cv2.medianBlur(gray_inv, 5)
+    circles = cv2.HoughCircles(
+        blur,
+        cv2.HOUGH_GRADIENT,
+        1.0,
+        10,
+        param1=80,
+        param2=10,
+        minRadius=2,
+        maxRadius=8,
+    )
+    if circles is None:
+        return np.empty((0, 2), dtype=np.float32)
+    return np.round(circles[0, :, :2]).astype(np.float32)
+
+
+def hessian_blob_multi(dark_lcn: np.ndarray) -> np.ndarray:
+    maps = []
+    for sigma in (1.4, 1.8, 2.2, 2.8):
+        smooth = cv2.GaussianBlur(dark_lcn, (0, 0), sigmaX=sigma, sigmaY=sigma)
+        dxx = cv2.Sobel(smooth, cv2.CV_32F, 2, 0, ksize=3)
+        dyy = cv2.Sobel(smooth, cv2.CV_32F, 0, 2, ksize=3)
+        dxy = cv2.Sobel(smooth, cv2.CV_32F, 1, 1, ksize=3)
+        det = dxx * dyy - dxy * dxy
+        trace = dxx + dyy
+        disc = np.sqrt(np.maximum(trace * trace - 4.0 * det, 0.0))
+        l1 = 0.5 * (trace + disc)
+        l2 = 0.5 * (trace - disc)
+        same_sign = (l1 > 0) & (l2 > 0)
+        isotropy = np.minimum(np.abs(l1), np.abs(l2)) / (
+            np.maximum(np.abs(l1), np.abs(l2)) + 1e-6
+        )
+        blobness = np.where(same_sign, np.sqrt(np.maximum(det, 0.0)) * isotropy, 0.0)
+        maps.append(normalize_u8(blobness))
+    return np.max(np.stack(maps, axis=0), axis=0).astype(np.uint8)
+
+
+def fft_best_map(dark_lcn: np.ndarray) -> np.ndarray:
+    h, w = dark_lcn.shape
+    fy = np.fft.fftfreq(h)
+    fx = np.fft.fftfreq(w)
+    fx_grid, fy_grid = np.meshgrid(fx, fy)
+    radius = np.sqrt(fx_grid * fx_grid + fy_grid * fy_grid)
+    f0 = 1.0 / 17.0
+    width = 0.014
+    mask = np.exp(-0.5 * ((radius - f0) / width) ** 2)
+    spectrum = np.fft.fft2(dark_lcn)
+    recon = np.fft.ifft2(spectrum * mask)
+    return normalize_u8(np.abs(recon))
+
+
+def topk_points(map_u8: np.ndarray, k: int, min_dist: float = 8.0) -> np.ndarray:
+    ys, xs = np.where(map_u8 > 0)
+    scores = map_u8[ys, xs].astype(np.float32)
+    order = np.argsort(scores)[::-1]
+    pts: list[tuple[float, float]] = []
+    r2 = min_dist * min_dist
+    for idx in order:
+        x = float(xs[idx])
+        y = float(ys[idx])
+        if all((x - px) ** 2 + (y - py) ** 2 > r2 for px, py in pts):
+            pts.append((x, y))
+            if len(pts) >= k:
+                break
+    return np.array(pts, dtype=np.float32)
+
+
+def merge_weighted_points(
+    points: np.ndarray, weights: np.ndarray, radius: float
+) -> tuple[np.ndarray, np.ndarray]:
+    order = np.argsort(weights)[::-1]
+    kept_pts: list[np.ndarray] = []
+    kept_w: list[float] = []
+    r2 = radius * radius
+    for idx in order:
+        p = points[idx]
+        w = float(weights[idx])
+        merged = False
+        for j, kp in enumerate(kept_pts):
+            if float(np.sum((p - kp) ** 2)) <= r2:
+                total = kept_w[j] + w
+                kept_pts[j] = (kp * kept_w[j] + p * w) / total
+                kept_w[j] = total
+                merged = True
+                break
+        if not merged:
+            kept_pts.append(p.copy())
+            kept_w.append(w)
+    return np.array(kept_pts, dtype=np.float32), np.array(kept_w, dtype=np.float32)
+
+
 def build_weighted_points(gray: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    response = local_range_response(gray)
-    response = cv2.GaussianBlur(response, (0, 0), 0.8)
-    threshold = float(np.percentile(response, 86))
-    mask = (response >= threshold).astype(np.uint8)
-    count, labels, stats, centers = cv2.connectedComponentsWithStats(mask, 8)
-    points: list[tuple[float, float]] = []
+    lcn = local_contrast_normalize(gray, win=41)
+    dark = np.clip(-lcn, 0.0, None)
+    gray_inv = 255 - gray
+    hough = hough_centers(gray_inv)
+    hessian = topk_points(hessian_blob_multi(dark), 220)
+    fft = topk_points(fft_best_map(dark), 220)
+    points: list[np.ndarray] = []
     weights: list[float] = []
-    for label in range(1, count):
-        area = int(stats[label, cv2.CC_STAT_AREA])
-        if area < 3 or area > 260:
-            continue
-        x, y = centers[label]
-        points.append((float(x), float(y)))
-        weights.append(float(response[labels == label].mean()) * max(1.0, area**0.5))
+    for p in hough:
+        points.append(p)
+        weights.append(1.0)
+    for p in hessian:
+        points.append(p)
+        weights.append(0.85)
+    for p in fft:
+        points.append(p)
+        weights.append(0.80)
     if not points:
         return np.empty((0, 2), dtype=np.float32), np.empty((0,), dtype=np.float32)
-    return np.asarray(points, dtype=np.float32), np.asarray(weights, dtype=np.float32)
+    return merge_weighted_points(
+        np.array(points, dtype=np.float32),
+        np.array(weights, dtype=np.float32),
+        radius=5.5,
+    )
 
 
-def candidate_bases(points: np.ndarray) -> list[tuple[np.ndarray, np.ndarray]]:
+def candidate_bases() -> list[tuple[np.ndarray, np.ndarray]]:
     bases: list[tuple[np.ndarray, np.ndarray]] = []
-    # Estimate dominant pitch from nearest-neighbor distances, then search around it.
-    pitch = 18.0
-    if len(points) >= 20:
-        sample = points[: min(len(points), 400)]
-        dists: list[float] = []
-        for point in sample:
-            delta = sample - point
-            lens = np.linalg.norm(delta, axis=1)
-            near = lens[(lens > 8.0) & (lens < 35.0)]
-            if near.size:
-                dists.append(float(np.min(near)))
-        if dists:
-            pitch = float(np.median(dists))
-    for p in np.arange(max(12.0, pitch - 4.0), pitch + 4.01, 0.6):
-        for angle_deg in np.arange(-8.0, 8.01, 2.0):
-            angle = np.deg2rad(angle_deg)
-            vx = np.array([np.cos(angle) * p, np.sin(angle) * p], dtype=np.float32)
-            vy_angle = angle + np.pi / 2.0
-            for shear in (-1.2, -0.6, 0.0, 0.6, 1.2):
-                vy = np.array(
-                    [np.cos(vy_angle) * p + shear, np.sin(vy_angle) * p],
-                    dtype=np.float32,
-                )
+    for ax in (3.0, 3.8, 4.6):
+        for ay in (95.0, 96.5, 98.0):
+            for sx in (15.8, 16.2):
+                for sy in (16.0, 16.6):
+                    vx = np.array(
+                        [math.cos(math.radians(ax)) * sx, math.sin(math.radians(ax)) * sx],
+                        dtype=np.float32,
+                    )
+                    vy = np.array(
+                        [math.cos(math.radians(ay)) * sy, math.sin(math.radians(ay)) * sy],
+                        dtype=np.float32,
+                    )
                 bases.append((vx, vy))
     return bases
+
+
+def fit_edges(points: np.ndarray, weights: np.ndarray, vx: np.ndarray, vy: np.ndarray) -> GridFit:
+    basis = np.column_stack((vx, vy))
+    inv = np.linalg.inv(basis)
+    coords = points @ inv.T
+    best: GridFit | None = None
+
+    for off_u in np.linspace(0.0, 0.92, 12):
+        for off_v in np.linspace(0.0, 0.92, 12):
+            shifted = coords - np.array([off_u, off_v], dtype=np.float32)
+            rounded = np.rint(shifted)
+            err = np.linalg.norm(shifted - rounded, axis=1)
+            good = err <= 0.34
+            if int(np.sum(good)) < 120:
+                continue
+            ij = rounded[good].astype(np.int32)
+            w = weights[good]
+            imin, imax = int(ij[:, 0].min()), int(ij[:, 0].max())
+            jmin, jmax = int(ij[:, 1].min()), int(ij[:, 1].max())
+            i_candidates = list(range(imin, imax - 18))
+            j_candidates = list(range(jmin, jmax - 18))
+            if not i_candidates or not j_candidates:
+                continue
+            i_scores = []
+            for left in i_candidates:
+                right = left + 19
+                left_score = float(w[ij[:, 0] == left].sum())
+                right_score = float(w[ij[:, 0] == right].sum())
+                i_scores.append((left_score + right_score, left))
+            j_scores = []
+            for top in j_candidates:
+                bottom = top + 19
+                top_score = float(w[ij[:, 1] == top].sum())
+                bottom_score = float(w[ij[:, 1] == bottom].sum())
+                j_scores.append((top_score + bottom_score, top))
+
+            top_lefts = [left for _, left in sorted(i_scores, reverse=True)[:5]]
+            top_tops = [top for _, top in sorted(j_scores, reverse=True)[:5]]
+
+            for left in top_lefts:
+                right = left + 19
+                i_ok = (ij[:, 0] >= left) & (ij[:, 0] <= right)
+                if np.sum(i_ok) < 70:
+                    continue
+                for top in top_tops:
+                    bottom = top + 19
+                    in_box = i_ok & (ij[:, 1] >= top) & (ij[:, 1] <= bottom)
+                    if np.sum(in_box) < 90:
+                        continue
+                    box_ij = ij[in_box]
+                    box_w = w[in_box]
+                    left_score = float(box_w[box_ij[:, 0] == left].sum())
+                    right_score = float(box_w[box_ij[:, 0] == right].sum())
+                    top_score = float(box_w[box_ij[:, 1] == top].sum())
+                    bottom_score = float(box_w[box_ij[:, 1] == bottom].sum())
+                    edge_score = left_score + right_score + top_score + bottom_score
+                    inside_score = float(box_w.sum())
+                    outside_score = float(w[~in_box].sum())
+                    score = 8.0 * edge_score + 0.8 * inside_score - 0.85 * outside_score
+                    origin_idx = np.array([left + off_u, top + off_v], dtype=np.float32)
+                    origin = origin_idx @ basis.T
+                    fit = GridFit(score, origin.astype(np.float32), vx.copy(), vy.copy())
+                    if best is None or fit.score > best.score:
+                        best = fit
+    if best is None:
+        raise RuntimeError("No edge fit found")
+    return best
 
 
 def fit_grid_frame(points: np.ndarray, weights: np.ndarray) -> GridFit:
     if len(points) == 0:
         raise RuntimeError("No weighted points for grid fit")
     best: GridFit | None = None
-    for vx, vy in candidate_bases(points):
-        basis = np.column_stack((vx, vy))
-        det = float(np.linalg.det(basis))
-        if abs(det) < 1e-3:
+    for vx, vy in candidate_bases():
+        try:
+            fit = fit_edges(points, weights, vx, vy)
+        except RuntimeError:
             continue
-        inv = np.linalg.inv(basis)
-        coords = points @ inv.T
-        u = coords[:, 0]
-        v = coords[:, 1]
-        for left in np.percentile(u, [2, 5, 8, 12]):
-            for top in np.percentile(v, [2, 5, 8, 12]):
-                origin = np.array([left, top], dtype=np.float32) @ basis.T
-                rel = (points - origin) @ inv.T
-                col = np.rint(rel[:, 0])
-                row = np.rint(rel[:, 1])
-                du = np.abs(rel[:, 0] - col)
-                dv = np.abs(rel[:, 1] - row)
-                inside = (
-                    (col >= 0)
-                    & (col < MODULE_COUNT)
-                    & (row >= 0)
-                    & (row < MODULE_COUNT)
-                    & (du < 0.34)
-                    & (dv < 0.34)
-                )
-                if not np.any(inside):
-                    continue
-                edge = inside & (
-                    (col == 0)
-                    | (row == 0)
-                    | (col == MODULE_COUNT - 1)
-                    | (row == MODULE_COUNT - 1)
-                )
-                outside = (
-                    (col < -1)
-                    | (col > MODULE_COUNT)
-                    | (row < -1)
-                    | (row > MODULE_COUNT)
-                )
-                score = (
-                    1.0 * float(weights[inside].sum())
-                    + 4.0 * float(weights[edge].sum())
-                    - 0.4 * float(weights[outside].sum())
-                    - abs(float(np.mean(inside)) - 0.45) * 50.0
-                )
-                if best is None or score > best.score:
-                    best = GridFit(score=score, origin=origin, vx=vx.copy(), vy=vy.copy())
+        if best is None or fit.score > best.score:
+            best = fit
     if best is None:
         raise RuntimeError("No grid fit found")
     return best

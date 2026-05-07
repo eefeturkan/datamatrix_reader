@@ -1,0 +1,11 @@
+decoded_text=#95C886177C ###=0512602541708S
+source_image=fabrikadan.png
+candidate=full_image
+candidate_offset=(0,0)
+kernel_size=3
+pad=0
+pad_value=0
+scale=1
+inverted=False
+format=Data Matrix
+position=630x447 789x411 828x561 672x603
