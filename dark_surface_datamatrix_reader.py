@@ -121,43 +121,81 @@ def build_candidates(
     return candidates, detections
 
 
-def processed_variants(gray: np.ndarray) -> Iterable[tuple[int, int, int, int, bool, np.ndarray]]:
-    for kernel_size in (3, 5, 7, 9, 11):
-        response = local_range_response(gray, kernel_size)
+def variant_params() -> list[tuple[int, int, int, int]]:
+    preferred = [
+        (9, 0, 0, 2),
+        (9, 50, 0, 1),
+        (9, 0, 0, 1),
+        (7, 50, 0, 1),
+        (7, 0, 0, 2),
+        (5, 0, 0, 2),
+        (3, 0, 0, 1),
+        (9, 50, 0, 2),
+        (7, 50, 0, 2),
+        (11, 0, 0, 2),
+    ]
+    all_params: list[tuple[int, int, int, int]] = []
+    for kernel_size in (9, 7, 5, 3, 11):
         for pad in (0, 50, 100):
-            for pad_value in (0, 255):
-                padded = (
-                    cv2.copyMakeBorder(
-                        response,
-                        pad,
-                        pad,
-                        pad,
-                        pad,
-                        cv2.BORDER_CONSTANT,
-                        value=pad_value,
-                    )
-                    if pad
-                    else response
-                )
-                for scale in (1, 2, 3, 4):
-                    scaled = (
-                        cv2.resize(
-                            padded,
-                            None,
-                            fx=scale,
-                            fy=scale,
-                            interpolation=cv2.INTER_CUBIC,
-                        )
-                        if scale > 1
-                        else padded
-                    )
-                    yield kernel_size, pad, pad_value, scale, False, scaled
-                    yield kernel_size, pad, pad_value, scale, True, 255 - scaled
+            pad_values = (0,) if pad == 0 else (0, 255)
+            for pad_value in pad_values:
+                for scale in (2, 1, 3, 4):
+                    all_params.append((kernel_size, pad, pad_value, scale))
+
+    ordered: list[tuple[int, int, int, int]] = []
+    seen: set[tuple[int, int, int, int]] = set()
+    for params in preferred + all_params:
+        if params in seen:
+            continue
+        seen.add(params)
+        ordered.append(params)
+    return ordered
 
 
-def decode_candidate(candidate: Candidate) -> DecodeHit | None:
+def processed_variants(
+    gray: np.ndarray,
+    max_variants: int | None = None,
+) -> Iterable[tuple[int, int, int, int, bool, np.ndarray]]:
+    emitted = 0
+    for kernel_size, pad, pad_value, scale in variant_params():
+        if max_variants is not None and emitted >= max_variants:
+            return
+        response = local_range_response(gray, kernel_size)
+        padded = (
+            cv2.copyMakeBorder(
+                response,
+                pad,
+                pad,
+                pad,
+                pad,
+                cv2.BORDER_CONSTANT,
+                value=pad_value,
+            )
+            if pad
+            else response
+        )
+        scaled = (
+            cv2.resize(
+                padded,
+                None,
+                fx=scale,
+                fy=scale,
+                interpolation=cv2.INTER_CUBIC,
+            )
+            if scale > 1
+            else padded
+        )
+        yield kernel_size, pad, pad_value, scale, False, scaled
+        emitted += 1
+        if max_variants is not None and emitted >= max_variants:
+            return
+        yield kernel_size, pad, pad_value, scale, True, 255 - scaled
+        emitted += 1
+
+
+def decode_candidate(candidate: Candidate, max_variants: int | None = None) -> DecodeHit | None:
     gray = cv2.cvtColor(candidate.image, cv2.COLOR_BGR2GRAY)
-    for kernel_size, pad, pad_value, scale, inverted, processed in processed_variants(gray):
+    for kernel_size, pad, pad_value, scale, inverted, processed in processed_variants(gray, max_variants):
         results = zxingcpp.read_barcodes(processed)
         for result in results:
             if str(result.format) == "Data Matrix" and result.text:
@@ -295,6 +333,7 @@ def run(
     conf: float,
     max_detections: int,
     skip_od: bool,
+    full_image_variants: int,
 ) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     image = read_image(image_path)
@@ -302,7 +341,7 @@ def run(
     candidates = [Candidate(name="full_image", image=image)]
 
     for candidate in candidates:
-        hit = decode_candidate(candidate)
+        hit = decode_candidate(candidate, max_variants=None if skip_od else full_image_variants)
         if hit is None:
             print(f"{candidate.name}: no decode")
             continue
@@ -400,6 +439,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", type=Path, default=Path("artifacts/dark_surface_reader"))
     parser.add_argument("--conf", type=float, default=0.01, help="Low OD confidence for dark-surface fallback")
     parser.add_argument("--max-detections", type=int, default=3)
+    parser.add_argument("--full-image-variants", type=int, default=24)
     parser.add_argument("--skip-od", action="store_true", help="Use full-image preprocessing only")
     return parser.parse_args()
 
@@ -414,6 +454,7 @@ def main() -> None:
             conf=args.conf,
             max_detections=args.max_detections,
             skip_od=args.skip_od,
+            full_image_variants=args.full_image_variants,
         )
     )
 
