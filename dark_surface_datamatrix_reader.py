@@ -101,6 +101,18 @@ def crop_with_padding(
     return Candidate(name=name, image=image[y1:y2, x1:x2].copy(), offset_x=x1, offset_y=y1)
 
 
+def crop_roi(image: np.ndarray, roi: tuple[int, int, int, int]) -> Candidate:
+    h, w = image.shape[:2]
+    x1, y1, x2, y2 = roi
+    x1 = max(0, min(w, x1))
+    x2 = max(0, min(w, x2))
+    y1 = max(0, min(h, y1))
+    y2 = max(0, min(h, y2))
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError(f"Invalid ROI after clipping: {(x1, y1, x2, y2)}")
+    return Candidate(name=f"roi_{x1}_{y1}_{x2}_{y2}", image=image[y1:y2, x1:x2].copy(), offset_x=x1, offset_y=y1)
+
+
 def build_candidates(
     image: np.ndarray,
     image_path: Path,
@@ -108,10 +120,11 @@ def build_candidates(
     conf: float,
     max_detections: int,
     skip_od: bool,
+    roi: tuple[int, int, int, int] | None = None,
 ) -> tuple[list[Candidate], list[Detection]]:
-    candidates = [Candidate(name="full_image", image=image)]
+    candidates = [crop_roi(image, roi)] if roi is not None else [Candidate(name="full_image", image=image)]
     detections: list[Detection] = []
-    if skip_od:
+    if skip_od or roi is not None:
         return candidates, detections
 
     detections = detect_with_yolo(model_path, image_path, conf)
@@ -334,20 +347,21 @@ def run(
     max_detections: int,
     skip_od: bool,
     full_image_variants: int,
+    roi: tuple[int, int, int, int] | None,
 ) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     image = read_image(image_path)
     detections: list[Detection] = []
-    candidates = [Candidate(name="full_image", image=image)]
+    candidates = [crop_roi(image, roi)] if roi is not None else [Candidate(name="full_image", image=image)]
 
     for candidate in candidates:
-        hit = decode_candidate(candidate, max_variants=None if skip_od else full_image_variants)
+        hit = decode_candidate(candidate, max_variants=full_image_variants)
         if hit is None:
             print(f"{candidate.name}: no decode")
             continue
         return write_success(image, image_path, output_dir, hit, detections)
 
-    if not skip_od:
+    if not skip_od and roi is None:
         candidates, detections = build_candidates(
             image=image,
             image_path=image_path,
@@ -355,6 +369,7 @@ def run(
             conf=conf,
             max_detections=max_detections,
             skip_od=False,
+            roi=None,
         )
         draw_detections(image, detections, output_dir / f"{image_path.stem}_detections.png")
 
@@ -440,6 +455,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--conf", type=float, default=0.01, help="Low OD confidence for dark-surface fallback")
     parser.add_argument("--max-detections", type=int, default=3)
     parser.add_argument("--full-image-variants", type=int, default=24)
+    parser.add_argument(
+        "--roi",
+        type=int,
+        nargs=4,
+        metavar=("X1", "Y1", "X2", "Y2"),
+        help="Crop and scan only this rectangular ROI before decoding.",
+    )
     parser.add_argument("--skip-od", action="store_true", help="Use full-image preprocessing only")
     return parser.parse_args()
 
@@ -455,6 +477,7 @@ def main() -> None:
             max_detections=args.max_detections,
             skip_od=args.skip_od,
             full_image_variants=args.full_image_variants,
+            roi=tuple(args.roi) if args.roi else None,
         )
     )
 
