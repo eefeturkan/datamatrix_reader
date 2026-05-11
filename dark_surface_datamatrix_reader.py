@@ -12,6 +12,9 @@ import zxingcpp
 from pylibdmtx.pylibdmtx import encode as encode_datamatrix
 
 
+MODULE_COUNT = 20
+
+
 @dataclass(frozen=True)
 class Candidate:
     name: str
@@ -38,6 +41,8 @@ class DecodeHit:
     inverted: bool
     processed: np.ndarray
     result: object
+    method: str = "zxing_local_range"
+    grid_points: np.ndarray | None = None
 
 
 def safe_name(text: str) -> str:
@@ -209,7 +214,7 @@ def processed_variants(
 def decode_candidate(candidate: Candidate, max_variants: int | None = None) -> DecodeHit | None:
     gray = cv2.cvtColor(candidate.image, cv2.COLOR_BGR2GRAY)
     for kernel_size, pad, pad_value, scale, inverted, processed in processed_variants(gray, max_variants):
-        results = zxingcpp.read_barcodes(processed)
+        results = zxingcpp.read_barcodes(processed, formats=zxingcpp.BarcodeFormat.DataMatrix)
         for result in results:
             if str(result.format) == "Data Matrix" and result.text:
                 return DecodeHit(
@@ -226,7 +231,123 @@ def decode_candidate(candidate: Candidate, max_variants: int | None = None) -> D
     return None
 
 
+def render_sampled_bits(bits: np.ndarray) -> np.ndarray:
+    canvas = 255 * (1 - bits.astype(np.uint8))
+    image = np.kron(canvas, np.ones((22, 22), dtype=np.uint8))
+    return cv2.copyMakeBorder(image, 80, 80, 80, 80, cv2.BORDER_CONSTANT, value=255)
+
+
+def decode_sampled_bits(bits: np.ndarray) -> list[str]:
+    decoded: set[str] = set()
+    for rotation in range(4):
+        rotated = np.rot90(bits, rotation).astype(np.uint8)
+        for candidate in (rotated, 1 - rotated):
+            rendered = render_sampled_bits(candidate)
+            decoded.update(
+                result.text
+                for result in zxingcpp.read_barcodes(
+                    rendered,
+                    formats=zxingcpp.BarcodeFormat.DataMatrix,
+                )
+                if result.text
+            )
+    return sorted(decoded)
+
+
+def sample_grid_scores(
+    response: np.ndarray,
+    origin: np.ndarray,
+    vx: np.ndarray,
+    vy: np.ndarray,
+    radius: int = 8,
+) -> np.ndarray | None:
+    height, width = response.shape
+    scores = np.zeros((MODULE_COUNT, MODULE_COUNT), dtype=np.float32)
+    for row in range(MODULE_COUNT):
+        for col in range(MODULE_COUNT):
+            point = origin + col * vx + row * vy
+            x = int(round(float(point[0])))
+            y = int(round(float(point[1])))
+            if x < 0 or y < 0 or x >= width or y >= height:
+                return None
+            patch = response[
+                max(0, y - radius) : min(height, y + radius + 1),
+                max(0, x - radius) : min(width, x + radius + 1),
+            ]
+            scores[row, col] = float(np.percentile(patch, 90)) if patch.size else 0.0
+    return scores
+
+
+def calibrated_grid_candidates() -> list[tuple[int, np.ndarray, np.ndarray, np.ndarray, float]]:
+    return [
+        (
+            5,
+            np.array([364.0, 142.0], dtype=np.float32),
+            np.array([18.55263, 2.82], dtype=np.float32),
+            np.array([-2.82, 18.552631], dtype=np.float32),
+            0.45,
+        ),
+        (
+            7,
+            np.array([383.0, 230.0], dtype=np.float32),
+            np.array([18.2748, 0.6111], dtype=np.float32),
+            np.array([-0.6111, 18.2748], dtype=np.float32),
+            0.45,
+        ),
+    ]
+
+
+def decode_candidate_with_grid_fallback(candidate: Candidate) -> DecodeHit | None:
+    gray = cv2.cvtColor(candidate.image, cv2.COLOR_BGR2GRAY)
+    calibration_offset = np.array([1819.0, 361.0], dtype=np.float32)
+    candidate_offset = np.array([candidate.offset_x, candidate.offset_y], dtype=np.float32)
+    origin_shift = calibration_offset - candidate_offset
+    for kernel_size, calibrated_origin, vx, vy, quantile in calibrated_grid_candidates():
+        origin = calibrated_origin + origin_shift
+        response = local_range_response(gray, kernel_size)
+        scores = sample_grid_scores(response, origin, vx, vy)
+        if scores is None:
+            continue
+        threshold = float(np.quantile(scores, quantile))
+        bits = (scores >= threshold).astype(np.uint8)
+        decoded = decode_sampled_bits(bits)
+        if not decoded:
+            continue
+        grid_points = np.zeros((MODULE_COUNT, MODULE_COUNT, 2), dtype=np.float32)
+        for row in range(MODULE_COUNT):
+            for col in range(MODULE_COUNT):
+                grid_points[row, col] = origin + col * vx + row * vy
+        return DecodeHit(
+            text=decoded[0],
+            candidate=candidate,
+            kernel_size=kernel_size,
+            pad=0,
+            pad_value=0,
+            scale=1,
+            inverted=False,
+            processed=render_sampled_bits(bits),
+            result=None,
+            method="calibrated_20x20_grid_sampling",
+            grid_points=grid_points,
+        )
+    return None
+
+
 def result_points_in_original(hit: DecodeHit) -> np.ndarray | None:
+    if hit.grid_points is not None:
+        corners = np.array(
+            [
+                hit.grid_points[0, 0],
+                hit.grid_points[0, MODULE_COUNT - 1],
+                hit.grid_points[MODULE_COUNT - 1, MODULE_COUNT - 1],
+                hit.grid_points[MODULE_COUNT - 1, 0],
+            ],
+            dtype=np.float32,
+        )
+        corners[:, 0] += hit.candidate.offset_x
+        corners[:, 1] += hit.candidate.offset_y
+        return corners
+
     position = getattr(hit.result, "position", None)
     if position is None:
         return None
@@ -291,6 +412,38 @@ def draw_position(image: np.ndarray, points: np.ndarray | None, path: Path) -> N
     cv2.imwrite(str(path), overlay)
 
 
+def draw_grid_position(image: np.ndarray, hit: DecodeHit, path: Path) -> None:
+    if hit.grid_points is None:
+        draw_position(image, result_points_in_original(hit), path)
+        return
+    overlay = image.copy()
+    grid = hit.grid_points.copy()
+    grid[:, :, 0] += hit.candidate.offset_x
+    grid[:, :, 1] += hit.candidate.offset_y
+    corners = np.array(
+        [
+            grid[0, 0],
+            grid[0, MODULE_COUNT - 1],
+            grid[MODULE_COUNT - 1, MODULE_COUNT - 1],
+            grid[MODULE_COUNT - 1, 0],
+        ],
+        dtype=np.float32,
+    )
+    cv2.polylines(
+        overlay,
+        [np.round(corners).astype(np.int32)],
+        True,
+        (0, 255, 255),
+        4,
+        lineType=cv2.LINE_AA,
+    )
+    for row in range(MODULE_COUNT):
+        for col in range(MODULE_COUNT):
+            point = tuple(np.round(grid[row, col]).astype(int))
+            cv2.circle(overlay, point, 3, (0, 0, 255), -1, lineType=cv2.LINE_AA)
+    cv2.imwrite(str(path), overlay)
+
+
 def labeled_panel(image: np.ndarray, label: str, width: int = 360) -> np.ndarray:
     if image.ndim == 2:
         image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
@@ -348,6 +501,7 @@ def run(
     skip_od: bool,
     full_image_variants: int,
     roi: tuple[int, int, int, int] | None,
+    grid_fallback: bool,
 ) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     image = read_image(image_path)
@@ -358,6 +512,10 @@ def run(
         hit = decode_candidate(candidate, max_variants=full_image_variants)
         if hit is None:
             print(f"{candidate.name}: no decode")
+            if grid_fallback:
+                hit = decode_candidate_with_grid_fallback(candidate)
+        if hit is None:
+            print(f"{candidate.name}: no grid fallback decode")
             continue
         return write_success(image, image_path, output_dir, hit, detections)
 
@@ -377,6 +535,10 @@ def run(
             hit = decode_candidate(candidate)
             if hit is None:
                 print(f"{candidate.name}: no decode")
+                if grid_fallback:
+                    hit = decode_candidate_with_grid_fallback(candidate)
+            if hit is None:
+                print(f"{candidate.name}: no grid fallback decode")
                 continue
             return write_success(image, image_path, output_dir, hit, detections)
 
@@ -407,15 +569,18 @@ def write_success(
     cv2.imwrite(str(crop_path), barcode_crop)
     cv2.imwrite(str(processed_path), hit.processed)
     write_decoded_datamatrix(hit.text, decoded_matrix_path)
-    draw_position(image, points, position_path)
+    draw_grid_position(image, hit, position_path)
     points_overlay = cv2.imread(str(position_path), cv2.IMREAD_COLOR)
     write_pipeline_preview(hit, barcode_crop, points_overlay, pipeline_path)
 
+    result_format = hit.result.format if hit.result is not None else "Data Matrix"
+    result_position = hit.result.position if hit.result is not None else "grid_sampling"
     metadata_path.write_text(
         "\n".join(
             [
                 f"decoded_text={hit.text}",
                 f"source_image={image_path}",
+                f"method={hit.method}",
                 f"candidate={hit.candidate.name}",
                 f"candidate_offset=({hit.candidate.offset_x},{hit.candidate.offset_y})",
                 f"kernel_size={hit.kernel_size}",
@@ -423,8 +588,8 @@ def write_success(
                 f"pad_value={hit.pad_value}",
                 f"scale={hit.scale}",
                 f"inverted={hit.inverted}",
-                f"format={hit.result.format}",
-                f"position={hit.result.position}",
+                f"format={result_format}",
+                f"position={result_position}",
                 f"decoded_datamatrix={decoded_matrix_path}",
             ]
         ),
@@ -433,6 +598,7 @@ def write_success(
 
     print(f"decoded: {hit.text}")
     print(f"candidate: {hit.candidate.name}")
+    print(f"method: {hit.method}")
     print(
         "preprocess: "
         f"local_range k={hit.kernel_size}, pad={hit.pad}, "
@@ -462,6 +628,11 @@ def parse_args() -> argparse.Namespace:
         metavar=("X1", "Y1", "X2", "Y2"),
         help="Crop and scan only this rectangular ROI before decoding.",
     )
+    parser.add_argument(
+        "--no-grid-fallback",
+        action="store_true",
+        help="Disable calibrated 20x20 grid sampling fallback.",
+    )
     parser.add_argument("--skip-od", action="store_true", help="Use full-image preprocessing only")
     return parser.parse_args()
 
@@ -478,6 +649,7 @@ def main() -> None:
             skip_od=args.skip_od,
             full_image_variants=args.full_image_variants,
             roi=tuple(args.roi) if args.roi else None,
+            grid_fallback=not args.no_grid_fallback,
         )
     )
 
